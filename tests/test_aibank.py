@@ -11,9 +11,11 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from aibank import fees as F
 from aibank import ledger as L
 from aibank import policy as P
-from aibank.bank import Bank, PolicyDenied
+from aibank import users as U
+from aibank.bank import Bank, NotFound, PolicyDenied
 from aibank.flutterwave import FlutterwaveClient, dedupe_key, verify_webhook
 from aibank.ledger import InsufficientFunds, Unbalanced, DuplicateIdempotencyKey
 from aibank.money import MoneyError, to_major, to_minor
@@ -304,8 +306,13 @@ class TestPayoutLifecycle(BankTestCase):
         self.assertEqual(self.bank.balance(self.ag["agent_id"])["balance_minor"], 8000000)
 
     def test_fee_is_booked_to_revenue(self):
+        # The fee is now SERVER-side: `fee=` in the request is ignored, so this
+        # configures the schedule instead. A flat NGN 50 on this payout.
+        with self.bank.db.write() as conn:
+            F.set_schedule(conn, "NGN", flat_minor=5000)
         out = self.bank.request_payout(self.ag["agent_id"], "10000", payee_id=self.payee,
                                        fee="50")
+        self.assertEqual(out["fee_minor"], 5000)
         self.bank.handle_webhook({"event": "transfer.completed",
             "data": {"id": 55, "reference": out["reference"], "status": "SUCCESSFUL"}})
         bal = self.bank.balance(self.ag["agent_id"])
@@ -313,6 +320,14 @@ class TestPayoutLifecycle(BankTestCase):
         fees = L.get_or_create_account(self.bank.conn, None, "revenue_fees", "NGN")
         self.assertEqual(L.balance(self.bank.conn, fees), 5000)
         self.assertEqual(L.trial_balance(self.bank.conn), 0)
+
+    def test_caller_supplied_fee_is_ignored(self):
+        """The spender must not be able to choose the platform's revenue."""
+        with self.bank.db.write() as conn:
+            F.set_schedule(conn, "NGN", flat_minor=0, bps=100)  # 1%
+        out = self.bank.request_payout(self.ag["agent_id"], "10000", payee_id=self.payee,
+                                       fee="0")
+        self.assertEqual(out["fee_minor"], 10000)  # 1% of 1,000,000 kobo
 
 
 class TestAuthAndWebhookSecurity(BankTestCase):

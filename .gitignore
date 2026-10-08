@@ -11,5 +11,5 @@ venv/
 # local scratch
 deny.json
 deny2.json
-_probe.py
+_probe*.py
 .env

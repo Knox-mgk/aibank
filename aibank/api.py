@@ -1,8 +1,19 @@
 """HTTP API on stdlib http.server. No framework, no wheels to compile.
 
-Agent-facing endpoints authenticate with `Authorization: Bearer sk_agent_...`.
-Admin endpoints use X-Admin-Key. The webhook endpoint verifies provider
-signatures over the RAW body before parsing.
+THREE DISTINCT TRUST DOMAINS, and keeping them apart is the whole security
+model of this service:
+
+  1. Agent  (`Authorization: Bearer sk_agent_...`)  -- may SPEND, under limits.
+     May never read or write policy, approve a payout, or see another agent.
+  2. User   (`Authorization: Bearer sess_...`)      -- the human account holder.
+     Sets the limits, funds wallets, approves payouts, creates agents.
+  3. Admin  (`X-Admin-Key`)                          -- platform operator.
+     Pricing, settlement funding, cross-tenant reads.
+
+An agent token presented to a user-domain route is rejected before any handler
+runs: `_user()` only accepts a session token, and sessions are only issued by
+password login. That is what makes "the human sets the limits and the agent
+merely follows them" an enforced property rather than a convention.
 """
 from __future__ import annotations
 
@@ -10,26 +21,42 @@ import json
 import os
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
-from .bank import Bank, BankError, PolicyDenied
+from . import fees as F
+from . import users as U
+from .bank import Bank, BankError, NotFound, PolicyDenied, _require_secret
 from .flutterwave import verify_webhook
 from .ledger import LedgerError, InsufficientFunds, DuplicateIdempotencyKey
 from .money import MoneyError
 
-ADMIN_KEY = os.environ.get("AIBANK_ADMIN_KEY", "admin-dev-key")
 SECRET_HASH = os.environ.get("FLW_SECRET_HASH", "")
+
+_ADMIN_KEY: str | None = None
+
+
+def admin_key() -> str:
+    """Fail closed, like FLW_SECRET_HASH already did.
+
+    The old default `"admin-dev-key"` meant a deployment that forgot to set
+    this had a publicly known admin credential and no error to warn anyone.
+    """
+    global _ADMIN_KEY
+    if _ADMIN_KEY is None:
+        _ADMIN_KEY = _require_secret("AIBANK_ADMIN_KEY", "admin-dev-key")
+    return _ADMIN_KEY
 
 
 def make_handler(bank: Bank):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
-        server_version = "aibank/0.1"
+        server_version = "aibank/0.2"
 
         def log_message(self, fmt, *args):
             print(f"[api] {self.address_string()} {fmt % args}")
 
         # -- plumbing --
-        def _send(self, code: int, obj: dict):
+        def _send(self, code: int, obj):
             body = json.dumps(obj, default=str).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
@@ -39,27 +66,52 @@ def make_handler(bank: Bank):
 
         def _raw(self) -> bytes:
             n = int(self.headers.get("Content-Length") or 0)
+            # A body this large is either a mistake or an attempt to exhaust
+            # memory on a phone-sized host. Refuse it before reading.
+            if n > 1_000_000:
+                raise BankError("request body too large")
             return self.rfile.read(n) if n else b""
 
         def _json(self, raw: bytes) -> dict:
             if not raw:
                 return {}
             try:
-                return json.loads(raw)
+                parsed = json.loads(raw)
             except ValueError:
                 raise BankError("body is not valid JSON")
+            if not isinstance(parsed, dict):
+                raise BankError("body must be a JSON object")
+            return parsed
+
+        def _bearer(self) -> str:
+            auth = self.headers.get("Authorization", "")
+            return auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+
+        def _client_ip(self) -> str:
+            return self.client_address[0] if self.client_address else "?"
 
         def _agent(self) -> str:
-            auth = self.headers.get("Authorization", "")
-            token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-            agent_id = bank.authenticate(token)
+            """Authenticate an AGENT. Rejects session tokens by construction."""
+            agent_id = bank.authenticate(self._bearer())
             if not agent_id:
                 raise PermissionError("invalid or missing agent API key")
             return agent_id
 
+        def _user(self) -> dict:
+            """Authenticate a HUMAN via dashboard session."""
+            sess = U.authenticate_session(bank, self._bearer())
+            if not sess:
+                raise PermissionError("invalid or expired session")
+            return sess
+
         def _admin(self):
-            if self.headers.get("X-Admin-Key") != ADMIN_KEY:
+            key = self.headers.get("X-Admin-Key") or ""
+            import hmac
+            if not hmac.compare_digest(key, admin_key()):
                 raise PermissionError("admin key required")
+
+        def _query(self, path: str) -> dict:
+            return {k: v[0] for k, v in parse_qs(urlparse(path).query).items()}
 
         # -- routes --
         def do_GET(self):
@@ -68,26 +120,180 @@ def make_handler(bank: Bank):
         def do_POST(self):
             self._route("POST", self.path, self._raw())
 
-        def _route(self, method: str, path: str, raw: bytes):
+        def _route(self, method: str, raw_path: str, raw: bytes):
+            path = urlparse(raw_path).path
+            q = self._query(raw_path)
             try:
+                # ---------------- public ----------------
                 if path == "/health":
-                    return self._send(200, {"ok": True, "service": "aibank"})
+                    return self._send(200, {"ok": True, "service": "aibank",
+                                            "schema": bank.schema_version()})
 
                 if path == "/v1/webhooks/flutterwave" and method == "POST":
                     if not verify_webhook(raw, dict(self.headers), SECRET_HASH):
                         return self._send(401, {"error": "invalid signature"})
                     return self._send(200, bank.handle_webhook(self._json(raw)))
 
-                if path == "/v1/agents" and method == "POST":
+                # ---------------- auth ----------------
+                if path == "/v1/auth/register" and method == "POST":
+                    b = self._json(raw)
+                    return self._send(201, U.create_user(
+                        bank, b["email"], b["password"], b.get("display_name")))
+
+                if path == "/v1/auth/login" and method == "POST":
+                    b = self._json(raw)
+                    return self._send(200, U.login(
+                        bank, b["email"], b["password"], client_ip=self._client_ip(),
+                        user_agent=self.headers.get("User-Agent")))
+
+                if path == "/v1/auth/logout" and method == "POST":
+                    self._user()
+                    return self._send(200, {"logged_out": U.logout(bank, self._bearer())})
+
+                if path == "/v1/auth/password" and method == "POST":
+                    s = self._user()
+                    b = self._json(raw)
+                    U.change_password(bank, s["user_id"], b["current_password"],
+                                      b["new_password"])
+                    return self._send(200, {"ok": True, "sessions_revoked": True})
+
+                # ---------------- dashboard (user session) ----------------
+                if path == "/v1/me" and method == "GET":
+                    # Dual-domain by design: an agent key describes the agent,
+                    # a session describes the human.
+                    if self._bearer().startswith("sess_"):
+                        s = self._user()
+                        return self._send(200, {"kind": "user",
+                                                **(U.get_user(bank, s["user_id"]) or {})})
+                    agent_id = self._agent()
+                    row = bank.conn.execute(
+                        "SELECT id, name, status, user_id FROM agents WHERE id=?",
+                        (agent_id,)).fetchone()
+                    return self._send(200, {"kind": "agent", **dict(row)})
+
+                if path == "/v1/dashboard" and method == "GET":
+                    s = self._user()
+                    return self._send(200, bank.dashboard(s["user_id"],
+                                                          q.get("currency", "NGN")))
+
+                if path == "/v1/wallet" and method == "GET":
+                    s = self._user()
+                    return self._send(200, bank.user_balance(
+                        s["user_id"], q.get("currency", "NGN")))
+
+                if path == "/v1/wallet/deposit" and method == "POST":
+                    # Stand-in for a real collection/virtual-account callback.
+                    # Admin-gated precisely because crediting a wallet from
+                    # nothing is not something a customer may do for themselves.
                     self._admin()
                     b = self._json(raw)
+                    entry = bank.deposit_to_user(
+                        b["user_id"], b["amount"], b.get("currency", "NGN"),
+                        idempotency_key=b.get("idempotency_key"))
+                    return self._send(201, {"entry_id": entry,
+                                            "balance": bank.user_balance(
+                                                b["user_id"], b.get("currency", "NGN"))})
+
+                if path == "/v1/agents" and method == "GET":
+                    s = self._user()
+                    return self._send(200, {"agents": bank.list_agents(s["user_id"])})
+
+                if path == "/v1/agents" and method == "POST":
+                    # A user creates their OWN agent; admin may create an
+                    # unowned one for platform/bootstrap use.
+                    b = self._json(raw)
+                    if self._bearer().startswith("sess_"):
+                        s = self._user()
+                        owner = s["user_id"]
+                    else:
+                        self._admin()
+                        owner = b.get("user_id")
                     return self._send(201, bank.create_agent(
                         name=b.get("name", "agent"), currency=b.get("currency", "NGN"),
+                        user_id=owner,
                         per_txn_max=b.get("per_txn_max"), daily_max=b.get("daily_max"),
                         monthly_max=b.get("monthly_max"),
                         allowlist_only=bool(b.get("allowlist_only", False)),
-                        require_approval_above=b.get("require_approval_above")))
+                        require_approval_above=b.get("require_approval_above"),
+                        max_payouts_per_day=b.get("max_payouts_per_day"),
+                        tz_offset_minutes=b.get("tz_offset_minutes")))
 
+                if path.startswith("/v1/agents/"):
+                    rest = path[len("/v1/agents/"):].split("/")
+                    agent_id = rest[0]
+                    tail = rest[1] if len(rest) > 1 else ""
+                    s = self._user()
+                    bank.require_agent_owner(s["user_id"], agent_id, s["role"])
+
+                    if tail == "policy" and method == "GET":
+                        return self._send(200, bank.get_policy(agent_id) or {})
+
+                    if tail == "policy" and method == "POST":
+                        # THE central invariant: this route is user-session only.
+                        # An agent key cannot reach it, so an agent can never
+                        # raise its own ceiling.
+                        b = self._json(raw)
+                        bank.set_policy(
+                            agent_id, currency=b.get("currency", "NGN"),
+                            per_txn_max=b.get("per_txn_max"),
+                            daily_max=b.get("daily_max"),
+                            monthly_max=b.get("monthly_max"),
+                            allowlist_only=bool(b.get("allowlist_only", False)),
+                            require_approval_above=b.get("require_approval_above"),
+                            max_payouts_per_day=b.get("max_payouts_per_day"),
+                            tz_name=b.get("tz_name"),
+                            tz_offset_minutes=b.get("tz_offset_minutes"),
+                            user_id=s["user_id"])
+                        return self._send(200, bank.get_policy(agent_id) or {})
+
+                    if tail == "freeze" and method == "POST":
+                        b = self._json(raw)
+                        return self._send(200, bank.freeze_agent(
+                            agent_id, frozen=bool(b.get("frozen", True)),
+                            user_id=s["user_id"]))
+
+                    if tail == "allocate" and method == "POST":
+                        b = self._json(raw)
+                        return self._send(201, bank.allocate_to_agent(
+                            s["user_id"], agent_id, b["amount"],
+                            b.get("currency", "NGN"),
+                            idempotency_key=b.get("idempotency_key")))
+
+                    if tail == "withdraw" and method == "POST":
+                        b = self._json(raw)
+                        return self._send(201, bank.withdraw_from_agent(
+                            s["user_id"], agent_id, b["amount"],
+                            b.get("currency", "NGN"),
+                            idempotency_key=b.get("idempotency_key")))
+
+                    if tail == "keys" and method == "GET":
+                        return self._send(200, {"keys": bank.list_api_keys(agent_id)})
+
+                    if tail == "keys" and method == "POST":
+                        b = self._json(raw)
+                        if b.get("revoke"):
+                            ok = bank.revoke_api_key(agent_id, b["revoke"],
+                                                     user_id=s["user_id"])
+                            return self._send(200 if ok else 404, {"revoked": ok})
+                        return self._send(201, bank.issue_api_key(
+                            agent_id, b.get("label"), user_id=s["user_id"]))
+
+                    if tail == "statement" and method == "GET":
+                        return self._send(200, bank.statement(
+                            agent_id, q.get("currency", "NGN"),
+                            limit=int(q.get("limit", 100)),
+                            offset=int(q.get("offset", 0))))
+
+                    if tail == "" and method == "GET":
+                        return self._send(200, bank.agent_detail(agent_id))
+
+                    return self._send(404, {"error": "not found", "path": path})
+
+                if path == "/v1/approvals" and method == "GET":
+                    s = self._user()
+                    return self._send(200, {"pending": bank.pending_approvals(s["user_id"])})
+
+                # ---------------- admin ----------------
                 if path == "/v1/fund" and method == "POST":
                     self._admin()
                     b = self._json(raw)
@@ -95,21 +301,43 @@ def make_handler(bank: Bank):
                                             b.get("currency", "NGN"),
                                             idempotency_key=b.get("idempotency_key"))
                     return self._send(201, {"entry_id": entry,
-                                            "balance": bank.balance(b["agent_id"], b.get("currency", "NGN"))})
+                                            "balance": bank.balance(
+                                                b["agent_id"], b.get("currency", "NGN"))})
 
-                if path == "/v1/me" and method == "GET":
-                    agent_id = self._agent()
-                    row = bank.conn.execute("SELECT id, name, status FROM agents WHERE id=?",
-                                            (agent_id,)).fetchone()
-                    return self._send(200, dict(row))
+                if path == "/v1/fees" and method == "GET":
+                    self._admin()
+                    return self._send(200, F.get_schedule(bank.conn,
+                                                          q.get("currency", "NGN")))
 
+                if path == "/v1/fees" and method == "POST":
+                    self._admin()
+                    b = self._json(raw)
+                    with bank.db.write() as conn:
+                        F.set_schedule(conn, b.get("currency", "NGN"),
+                                       flat_minor=int(b.get("flat_minor", 0)),
+                                       bps=int(b.get("bps", 0)),
+                                       min_minor=int(b.get("min_minor", 0)),
+                                       cap_minor=b.get("cap_minor"))
+                    return self._send(200, F.get_schedule(bank.conn,
+                                                          b.get("currency", "NGN")))
+
+                if path == "/v1/admin/sweep-holds" and method == "POST":
+                    self._admin()
+                    return self._send(200, bank.sweep_expired_holds())
+
+                if path == "/v1/admin/trial-balance" and method == "GET":
+                    self._admin()
+                    return self._send(200, bank.trial_balance(q.get("currency")))
+
+                # ---------------- agent-facing ----------------
                 if path.startswith("/v1/balance") and method == "GET":
                     agent_id = self._agent()
-                    cur = "NGN"
-                    if "?" in path:
-                        from urllib.parse import parse_qs, urlparse
-                        cur = parse_qs(urlparse(path).query).get("currency", ["NGN"])[0]
-                    return self._send(200, bank.balance(agent_id, cur))
+                    return self._send(200, bank.balance(agent_id,
+                                                        q.get("currency", "NGN")))
+
+                if path == "/v1/payees" and method == "GET":
+                    agent_id = self._agent()
+                    return self._send(200, {"payees": bank.list_payees(agent_id)})
 
                 if path == "/v1/payees" and method == "POST":
                     agent_id = self._agent()
@@ -117,6 +345,16 @@ def make_handler(bank: Bank):
                     pid = bank.add_payee(agent_id, b["label"], b["bank_code"],
                                          b["account_number"], b.get("currency", "NGN"))
                     return self._send(201, {"payee_id": pid})
+
+                if path == "/v1/quote" and method == "GET":
+                    agent_id = self._agent()
+                    cur = q.get("currency", "NGN")
+                    from .money import to_minor
+                    minor = to_minor(q.get("amount", "0"), cur)
+                    fee = F.quote(bank.conn, minor, cur)
+                    return self._send(200, {"amount_minor": minor, "fee_minor": fee,
+                                            "total_minor": minor + fee,
+                                            "currency": cur})
 
                 if path == "/v1/payouts" and method == "POST":
                     agent_id = self._agent()
@@ -126,35 +364,95 @@ def make_handler(bank: Bank):
                         agent_id, b["amount"], b.get("currency", "NGN"),
                         payee_id=b.get("payee_id"), bank_code=b.get("bank_code"),
                         account_number=b.get("account_number"),
-                        narration=b.get("narration", ""), fee=b.get("fee", 0),
+                        narration=b.get("narration", ""),
                         idempotency_key=idem)
                     return self._send(201, out)
 
-                if path.startswith("/v1/payouts/") and method == "GET":
-                    self._agent()
-                    return self._send(200, bank.get_payout(path.rsplit("/", 1)[-1]))
+                if path == "/v1/payouts" and method == "GET":
+                    # Scoped by whichever credential was presented.
+                    if self._bearer().startswith("sess_"):
+                        s = self._user()
+                        rows = bank.list_payouts(user_id=s["user_id"],
+                                                 status=q.get("status"),
+                                                 limit=int(q.get("limit", 50)),
+                                                 offset=int(q.get("offset", 0)))
+                    else:
+                        agent_id = self._agent()
+                        rows = bank.list_payouts(agent_id=agent_id,
+                                                 status=q.get("status"),
+                                                 limit=int(q.get("limit", 50)),
+                                                 offset=int(q.get("offset", 0)))
+                    return self._send(200, {"payouts": rows})
+
+                if path.startswith("/v1/payouts/"):
+                    rest = path[len("/v1/payouts/"):].split("/")
+                    payout_id = rest[0]
+                    tail = rest[1] if len(rest) > 1 else ""
+
+                    # Human decisions: session only. An agent approving its own
+                    # payout would void the approval threshold entirely.
+                    if tail in ("approve", "reject", "refund") and method == "POST":
+                        s = self._user()
+                        bank.get_payout(payout_id, user_id=s["user_id"])  # ownership
+                        b = self._json(raw)
+                        if tail == "approve":
+                            return self._send(200, bank.approve_payout(
+                                payout_id, narration=b.get("narration", ""),
+                                user_id=s["user_id"], reason=b.get("reason")))
+                        if tail == "reject":
+                            return self._send(200, bank.reject_payout(
+                                payout_id, user_id=s["user_id"],
+                                reason=b.get("reason", "rejected by account holder")))
+                        return self._send(200, bank.refund_payout(
+                            payout_id, user_id=s["user_id"],
+                            reason=b.get("reason", "refund")))
+
+                    if tail == "reconcile" and method == "POST":
+                        s = self._user()
+                        bank.get_payout(payout_id, user_id=s["user_id"])
+                        return self._send(200, bank.reconcile(payout_id))
+
+                    if tail == "" and method == "GET":
+                        # TIER 1 FIX: scope the read. Previously any agent key
+                        # could fetch any agent's payout by id.
+                        if self._bearer().startswith("sess_"):
+                            s = self._user()
+                            return self._send(200, bank.get_payout(
+                                payout_id, user_id=s["user_id"]))
+                        agent_id = self._agent()
+                        return self._send(200, bank.get_payout(
+                            payout_id, agent_id=agent_id))
 
                 return self._send(404, {"error": "not found", "path": path})
 
             except PermissionError as exc:
                 self._send(401, {"error": str(exc)})
+            except U.LockedOut as exc:
+                self._send(429, {"error": "locked_out", "reason": str(exc)})
+            except U.AuthError as exc:
+                self._send(401, {"error": "auth_failed", "reason": str(exc)})
+            except NotFound as exc:
+                self._send(404, {"error": "not_found", "reason": str(exc)})
             except PolicyDenied as exc:
                 self._send(403, {"error": "policy_denied", "reason": str(exc)})
             except InsufficientFunds as exc:
                 self._send(402, {"error": "insufficient_funds", "reason": str(exc)})
             except DuplicateIdempotencyKey as exc:
                 self._send(409, {"error": "duplicate", "entry_id": exc.existing_entry_id})
-            except (MoneyError, LedgerError, BankError, KeyError) as exc:
+            except (MoneyError, LedgerError, BankError, KeyError, ValueError) as exc:
                 self._send(400, {"error": type(exc).__name__, "reason": str(exc)})
             except Exception as exc:  # noqa: BLE001
+                # Log the detail, return none of it: a stack-trace string in a
+                # response body is a free schema disclosure.
                 traceback.print_exc()
-                self._send(500, {"error": "internal", "reason": str(exc)})
+                self._send(500, {"error": "internal"})
 
     return Handler
 
 
 def serve(db_path: str = "aibank.db", host: str = "127.0.0.1", port: int = 8000):
     bank = Bank(db_path)
+    admin_key()  # fail fast at boot rather than on the first admin request
     httpd = ThreadingHTTPServer((host, port), make_handler(bank))
     print(f"aibank listening on http://{host}:{port}  (db={db_path})")
     httpd.serve_forever()
