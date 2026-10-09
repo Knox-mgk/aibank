@@ -222,10 +222,42 @@ Each of these was reproduced by a test before being fixed, and the test remains:
 
 ---
 
+## Try it in one command, with fake money
+
+Before you connect a payment provider, see what you would be operating. This
+starts the service against the **in-process test fake** instead of Flutterwave,
+seeds a throwaway database, and prints a URL and a password:
+
+```bash
+git clone https://github.com/Knox-mgk/aibank
+cd aibank
+python3 scripts/demo/serve_demo.py
+```
+
+No credential, no account, no network call leaves the machine — the provider's
+HTTP transport is replaced before the service is constructed, so nothing in the
+demo can move real money. Python 3.11+ is the only prerequisite.
+
+The seeded data is chosen to show every state the dashboard must render rather
+than a flattering one: an agent with limits and settled history, one with a
+payout parked above its approval threshold, one with **no policy at all** (which
+means it can spend nothing — deny by default), and one frozen. Two payouts wait
+for your approval, one of them to a raw account number with no saved payee, and
+a refund sits on the books so the history shows a reversal. The seeder drives
+settlement through the real webhook handler rather than writing `successful`
+into a row, so the trial balance still nets to zero — a demo database the real
+code could actually have produced.
+
+`--reseed` rebuilds it, `--port` moves it, and `--host 0.0.0.0` lets another
+device on a trusted network look (it warns, because the page posts a password
+over plain HTTP).
+
+---
+
 ## Run it
 
-**Self-hosted, and that is the whole shape.** You run aibank against *your
-own* Flutterwave credentials. It never holds your money, there is no custody
+**Self-hosted, and that is the whole shape.** You run aibank against your
+*own* Flutterwave credentials. It never holds your money, there is no custody
 and no payment licence involved, and the operator of the deployment is you.
 
 One command, from clone to a running service with a verified backup:
@@ -422,6 +454,20 @@ actually executes, renders real data, and that clicking Approve or Allocate
 issues the right request with an idempotency key. Neither proves the page
 *looks* right; they prove it is not blank.
 
+`dom_check.mjs` takes a base URL, so the same harness runs against any seeded
+server — including the demo above. Its expectations are read from
+`/v1/dashboard` at startup rather than hard-coded, because a harness that
+asserts its own fixture values reports failures for a page that is rendering
+correctly, and that is worse than no test. It refuses to run against a server
+with no agents or no pending approvals instead of letting those assertions
+quietly become vacuous passes.
+
+To see the page with content, run the demo server and open it:
+
+```bash
+python3 scripts/demo/serve_demo.py      # prints a URL and a password
+```
+
 ## HTTP surface
 
 ```
@@ -469,6 +515,7 @@ GET    /health                            GET    /  ·  /dashboard  (the UI)
 | `deploy/systemd/` | unit plus sweep and backup timers, hardened |
 | `scripts/smoke_*.py` | 338 assertions against live servers |
 | `scripts/dom_check.mjs` | runs the page's real JS against a minimal DOM |
+| `scripts/demo/` | one-command demo: fake provider, seeded data, no credential |
 | `tests/` | 128 tests, including the concurrency suite |
 
 ## Known limits
