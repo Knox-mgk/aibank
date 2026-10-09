@@ -120,6 +120,26 @@ def evaluate(conn, agent_id: str, amount_minor: int, fee_minor: int,
         # No policy configured == no authority to spend. Fail closed.
         return Decision(False, "no spend policy configured for agent")
 
+    # A policy ROW with no bound of any kind is the same thing as no policy,
+    # and it is the state `create_agent` produces when called without limits --
+    # so the check above was dead code and an agent could be born able to drain
+    # its whole wallet in one unapproved payout. The product's entire claim is
+    # a ceiling the agent cannot raise; no ceiling must therefore deny.
+    #
+    # `require_approval_above` counts as a bound: with it set, no payout above
+    # it proceeds without a human, so autonomous spend is capped even with
+    # every amount limit blank. Any ONE of these is enough, so partially
+    # configured policies stay legal.
+    #
+    # NOT closed here: a threshold alone still permits unlimited payouts just
+    # under it. `max_payouts_per_day` is the control for that drip, and it is
+    # independent of this check.
+    if (pol["per_txn_max_minor"] is None
+            and pol["daily_max_minor"] is None
+            and pol["monthly_max_minor"] is None
+            and pol["require_approval_above_minor"] is None):
+        return Decision(False, "no spend limit configured for agent")
+
     if pol["currency"] != currency:
         return Decision(False, f"policy covers {pol['currency']}, not {currency}")
 

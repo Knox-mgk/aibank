@@ -168,9 +168,10 @@ td{padding:7px 8px;border-bottom:1px solid #1b2533;vertical-align:top}
             <input id="naApprove" placeholder="25000"></div>
           <div><button id="createAgent" class="primary">Create</button></div>
         </div>
-        <p class="small muted">Limits are in major units (naira). Leave a field
-          blank for "no limit" — but an agent with no per-payment ceiling can
-          spend its entire wallet in one call.</p>
+        <p class="small muted">Limits are in major units (naira). A blank field
+          is simply not checked, but an agent needs at least one of the three
+          amount limits or an approval threshold — with none of them set it is
+          refused every payment rather than allowed any.</p>
       </details>
     </div>
 
@@ -517,7 +518,7 @@ function paneLimits(a) {
     c.appendChild(el("label", null, label));
     const i = el("input");
     i.value = num(val);
-    i.placeholder = "no limit";
+    i.placeholder = "not checked";
     inputs[k] = i;
     c.appendChild(i);
     row.appendChild(c);

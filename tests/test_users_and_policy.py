@@ -1017,6 +1017,35 @@ class TestSecretsFailClosed(Base):
             importlib.reload(B)
             from aibank import api as A2
             importlib.reload(A2)
+            _rebind_reloaded(B)
+
+
+def _rebind_reloaded(module) -> None:
+    """Point every test module's imported names back at the reloaded classes.
+
+    `importlib.reload` re-executes the module body in the same module object,
+    so `aibank.bank.PolicyDenied` becomes a BRAND NEW class while every
+    `from aibank.bank import PolicyDenied` done at test-collection time still
+    references the old one. The two are not identical, so `assertRaises`
+    stops matching and the exception escapes as an ERROR whose text is
+    exactly what the test was waiting for -- a failure that accuses the
+    product of a bug it does not have.
+
+    This bit only the tests that happen to sort AFTER the reloading class in
+    the same run, so the suite could pass or fail depending on nothing but a
+    test's NAME. Rebinding here keeps that ordering dependency from silently
+    deciding whether a money-movement guard looks broken.
+    """
+    for mod in list(sys.modules.values()):
+        name = getattr(mod, "__name__", "")
+        if not (name.startswith("test") or name.startswith("tests.")):
+            continue
+        for attr, old in list(vars(mod).items()):
+            if (isinstance(old, type)
+                    and getattr(old, "__module__", None) == module.__name__):
+                fresh = getattr(module, attr, None)
+                if isinstance(fresh, type) and fresh is not old:
+                    setattr(mod, attr, fresh)
 
 
 class TestConcurrentIdempotency(Base):
@@ -1058,6 +1087,73 @@ class TestConcurrentIdempotency(Base):
         # And only ONE hold was placed, so the money was reserved once.
         held = bank.balance(ag["agent_id"])["held_minor"]
         self.assertEqual(held, 100_000)
+
+
+class TestUnboundedPolicyDenies(Base):
+    """An agent with no bound of any kind must not be able to spend.
+
+    The bug: `create_agent` always INSERTs a policy row, so the
+    `pol is None` guard in `policy.evaluate` was unreachable and an agent
+    created without limits got a row of all-NULL ceilings -- which every
+    limit check skips. The result was the exact inverse of the product's
+    claim: the least-configured agent had the most authority, and could
+    move its whole wallet in one payout with no approval.
+    """
+
+    def _agent_with(self, **policy_kwargs):
+        bank, _ = make_bank()
+        u = U.create_user(bank, "owner@example.com", "correct-horse-battery")
+        ag = bank.create_agent("a", user_id=u["user_id"], **policy_kwargs)
+        bank.deposit_to_user(u["user_id"], "100000", idempotency_key="d")
+        bank.allocate_to_agent(u["user_id"], ag["agent_id"], "50000",
+                               idempotency_key="al")
+        return bank, u, ag
+
+    def test_agent_created_with_no_limits_cannot_spend(self):
+        bank, u, ag = self._agent_with()
+        with self.assertRaises(PolicyDenied) as cm:
+            bank.request_payout(ag["agent_id"], "40000", bank_code="058",
+                                account_number="0690000031",
+                                idempotency_key="k1")
+        self.assertIn("no spend limit", str(cm.exception))
+
+    def test_denial_is_about_the_missing_limit_not_the_amount(self):
+        """A trivial payment is refused too -- the LIMIT is what is absent."""
+        bank, u, ag = self._agent_with()
+        with self.assertRaises(PolicyDenied):
+            bank.request_payout(ag["agent_id"], "1", bank_code="058",
+                                account_number="0690000031",
+                                idempotency_key="k2")
+
+    def test_any_single_bound_is_enough(self):
+        """Partially configured policies must stay legal, one field at a time.
+
+        Including `require_approval_above` alone: with it set, nothing above
+        it moves without a human, so autonomous spend is bounded even though
+        every amount ceiling is blank.
+        """
+        for kw in ({"per_txn_max": "10000"},
+                   {"daily_max": "10000"},
+                   {"monthly_max": "10000"},
+                   {"require_approval_above": "10000"}):
+            with self.subTest(**kw):
+                bank, u, ag = self._agent_with(**kw)
+                out = bank.request_payout(ag["agent_id"], "5000",
+                                          bank_code="058",
+                                          account_number="0690000031",
+                                          idempotency_key="ok")
+                self.assertIn(out["status"],
+                              ("submitted", "successful", "pending_approval"))
+                self.assertTrue(bank.trial_balance()["balanced"])
+
+    def test_clearing_every_limit_later_also_denies(self):
+        """The hole must stay shut when limits are REMOVED, not just at birth."""
+        bank, u, ag = self._agent_with(per_txn_max="10000")
+        bank.set_policy(ag["agent_id"], currency="NGN")   # all ceilings blank
+        with self.assertRaises(PolicyDenied):
+            bank.request_payout(ag["agent_id"], "5000", bank_code="058",
+                                account_number="0690000031",
+                                idempotency_key="k3")
 
 
 if __name__ == "__main__":

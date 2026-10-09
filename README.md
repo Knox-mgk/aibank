@@ -102,7 +102,12 @@ Evaluated server-side before funds are held, deny-by-default:
 - approval threshold above a configurable amount
 - freeze: a frozen agent cannot spend at all
 - **suspending the human immediately stops all of their agents**
-- **no policy means no spending** — the default is deny, not allow
+- **no limits means no spending** — the default is deny, not allow. An agent
+  needs at least one of the three amount ceilings or an approval threshold;
+  with none set, every payout is refused rather than permitted. This was a real
+  bug, not just a design note: `create_agent` always wrote a policy row, so the
+  "no policy" deny branch was unreachable and an agent created without limits
+  could move its entire wallet in one unapproved payout
 
 ## Payout lifecycle
 

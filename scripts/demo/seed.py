@@ -91,8 +91,10 @@ def seed(bank) -> dict:
                         narration="contractor payout")
     out["agents"].append(a2)
 
-    # ---- agent 3: NO POLICY. Deny-by-default means it cannot spend at all.
-    # Worth rendering: an agent with no limits must not read as "unlimited".
+    # ---- agent 3: NO LIMITS AT ALL. Deny-by-default means it cannot spend a
+    # single naira: with no amount ceiling and no approval threshold there is
+    # nothing bounding it, so every payout is refused. Worth rendering because
+    # an unconfigured agent must not read as "unlimited" on the page.
     a3 = bank.create_agent("sandbox-agent", user_id=uid)
     bank.allocate_to_agent(uid, a3["agent_id"], "50000")
     out["agents"].append(a3)

@@ -290,7 +290,10 @@ class Bank:
         human had set, which is a silent widening of the agent's authority.
 
         So the API representation carries both: `*_minor` for exactness, and
-        the decimal string for display. `None` means genuinely unlimited.
+        the decimal string for display. `None` means that particular ceiling
+        is not checked -- NOT that the agent is unlimited, since an agent with
+        no ceiling and no approval threshold is denied outright by
+        `policy.evaluate`.
         """
         row = P.get_policy(self.conn, agent_id)
         if not row:
