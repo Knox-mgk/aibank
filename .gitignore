@@ -16,6 +16,13 @@ _probe*.py
 backups/
 quickstart-tests.log
 
+# Build artifacts. `python -m build` regenerates these from the source tree, so
+# committing them would publish a stale wheel alongside the code it no longer
+# matches.
+dist/
+build/
+*.egg-info/
+
 # TLS material for a self-hosted deployment. A private key committed to a
 # public repo is compromised the moment it is pushed.
 deploy/certs/

@@ -1,0 +1,24 @@
+# The sdist is the auditable copy of this project: a reviewer should be able to
+# unpack it and run the same gate CI runs. setuptools' default heuristic picked
+# up `tests/test_*.py` but NOT `tests/__init__.py` or `tests/fake_flw.py`, which
+# would ship a test suite that cannot import itself — worse than shipping none.
+include LICENSE
+include README.md
+include .env.example
+include Dockerfile
+include compose.yaml
+
+recursive-include tests *.py
+recursive-include scripts *.py *.mjs
+recursive-include deploy *.sh *.conf *.service *.timer
+
+# The dashboard ships in the wheel too (package-data); api.py reads it off disk.
+recursive-include aibank/static *.html
+
+# Never ship state, secrets or build droppings.
+exclude .env
+global-exclude *.db *.db-shm *.db-wal *.pem *.key
+global-exclude *.py[cod]
+prune **/__pycache__
+prune deploy/certs
+prune backups

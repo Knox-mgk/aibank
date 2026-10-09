@@ -439,6 +439,13 @@ def migrate(conn: sqlite3.Connection) -> list[int]:
 _MEM_SEQ = itertools.count()
 _SCRATCH_DIRS: list[str] = []
 
+# Closing another thread's connection is only safe when the sqlite3 module is
+# compiled fully serialized. `threadsafety == 3` is exactly that guarantee
+# (SQLITE_THREADSAFE=1, serialized mode); 0-2 are not, so we leave sqlite3's
+# own same-thread check in place there and let `close()` report what it could
+# not reach instead of silently relaxing a safety property to tidy a warning.
+_CROSS_THREAD_CLOSE = sqlite3.threadsafety >= 3
+
 
 def _cleanup_scratch() -> None:
     for d in _SCRATCH_DIRS:
@@ -464,12 +471,32 @@ def ephemeral_path() -> str:
     return os.path.join(d, "aibank.db")
 
 
-def connect(path: str | Path) -> sqlite3.Connection:
-    """One connection. Callers must not share these across threads -- use Database."""
+def connect(path: str | Path, cross_thread_close: bool = False) -> sqlite3.Connection:
+    """One connection. Callers must not share these across threads -- use Database.
+
+    `cross_thread_close` relaxes sqlite3's same-thread check, and `Database`
+    sets it for the per-thread connections it hands out. WHY: sqlite3 refuses
+    *every* operation on a connection from a foreign thread, `close()`
+    included, so `Database.close()` could not actually close the connections
+    belonging to threads that had already exited -- it caught the resulting
+    ProgrammingError as `sqlite3.Error` and silently moved on. The connections
+    stayed open until the interpreter's GC got to them, which under a threaded
+    HTTP server means file descriptors and WAL files held by dead threads.
+
+    This does not introduce sharing: each thread still gets its own connection
+    and writes are serialized by `Database._write_lock`. The only cross-thread
+    operation is the close at shutdown, and the sqlite3 module is compiled
+    serialized here (`sqlite3.threadsafety == 3`) so that is safe. Where it is
+    not, `Database` leaves the check on and reports what it could not close
+    rather than pretending.
+    """
     p = str(path)
     if p == ":memory:":
         p = ephemeral_path()
-    conn = sqlite3.connect(p, isolation_level=None, timeout=30.0)
+    kwargs = {}
+    if cross_thread_close:
+        kwargs["check_same_thread"] = False
+    conn = sqlite3.connect(p, isolation_level=None, timeout=30.0, **kwargs)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
@@ -563,7 +590,7 @@ class Database:
     def conn(self) -> sqlite3.Connection:
         c = getattr(self._local, "conn", None)
         if c is None:
-            c = connect(self.path)
+            c = connect(self.path, cross_thread_close=_CROSS_THREAD_CLOSE)
             self._local.conn = c
             with self._conns_lock:
                 self._all_conns.append(c)
@@ -587,20 +614,30 @@ class Database:
             else:
                 conn.execute("COMMIT")
 
-    def close(self):
+    def close(self) -> int:
         """Close EVERY thread's connection, not just the caller's.
 
         Worker threads exit without closing theirs; leaking them keeps WAL
-        files open and, under a test runner, exhausts file descriptors.
+        files and file descriptors open.
+
+        Returns the number it could NOT close. That used to be invisible: the
+        `except sqlite3.Error` below swallows ProgrammingError, which is
+        exactly what sqlite3 raises for a cross-thread `close()` -- so on a
+        build without serialized threading this method closed nothing and
+        reported success. The connections are now opened with
+        `check_same_thread=False` where that is safe (see `connect`), and
+        where it is not, the count comes back non-zero instead of lying.
         """
         with self._conns_lock:
             conns, self._all_conns = self._all_conns, []
+        failed = 0
         for c in conns:
             try:
                 c.close()
             except sqlite3.Error:
-                pass
+                failed += 1
         self._local.conn = None
+        return failed
 
 
 def init_db(path: str | Path) -> sqlite3.Connection:

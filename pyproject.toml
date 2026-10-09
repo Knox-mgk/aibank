@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aibank"
+version = "0.1.0"
+description = "Self-hosted double-entry banking backend where humans hold the money and AI agents spend it under limits they cannot reach. Policy-bounded payouts, idempotent ledger, MCP server. Zero dependencies."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Odusipe Kayode Oluwaseun" }]
+keywords = [
+    "ai-agents", "agent-payments", "mcp", "mcp-server", "ledger",
+    "double-entry-accounting", "payments", "fintech", "flutterwave",
+    "nigeria", "zero-dependencies",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    # No "License ::" classifier: PEP 639 superseded those by the `license`
+    # expression above, and setuptools refuses a build that carries both.
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    # Floor is 3.11, matching deploy/quickstart.sh's own version gate. The
+    # code itself runs on 3.9 (checked with vermin), but nothing tests it
+    # there and the documented install path refuses it, so claiming 3.9 would
+    # let pip install a configuration this project does not support.
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Office/Business :: Financial :: Accounting",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+# No runtime dependencies, deliberately. The whole service is standard library
+# only, so `pip install aibank` pulls in nothing you did not audit.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Knox-mgk/aibank"
+Source = "https://github.com/Knox-mgk/aibank"
+Issues = "https://github.com/Knox-mgk/aibank/issues"
+
+[project.scripts]
+# `aibank` is the operator CLI (migrate / serve / backup / reconcile).
+aibank = "aibank.cli:main"
+# `aibank-mcp` is what an agent runtime spawns: stdio JSON-RPC, agent key only.
+aibank-mcp = "aibank.mcp_server:main"
+
+[tool.setuptools]
+# Explicit, not auto-discovery: `scripts/`, `tests/` and `deploy/` are the gate
+# and the deployment recipes, not importable library code.
+packages = ["aibank"]
+
+[tool.setuptools.package-data]
+# The dashboard is read off disk at request time by api.py (STATIC_DIR), so it
+# has to ship inside the wheel or `GET /` returns 404 on an installed copy.
+aibank = ["static/*.html"]

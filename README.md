@@ -17,7 +17,8 @@ It ships both ends of that: a **dashboard** for the human and an **MCP server**
 so the agent spends through typed tools instead of hand-rolled HTTP.
 
 ```
-128 unit tests + 338 live assertions against real servers, 0 failures
+148 unit tests + 338 live assertions against real servers
+ 33 assertions against the built-and-installed wheel, 0 failures
 ```
 
 ---
@@ -265,7 +266,37 @@ over plain HTTP).
 *own* Flutterwave credentials. It never holds your money, there is no custody
 and no payment licence involved, and the operator of the deployment is you.
 
-One command, from clone to a running service with a verified backup:
+### Install the package
+
+```bash
+pip install aibank                   # not yet uploaded — see below
+aibank migrate                       # explicit, never implicit
+aibank create-user you@example.com
+aibank serve --port 8000
+```
+
+**The PyPI name is not claimed yet**, so until the first upload install from
+the repo instead — same two commands, same behaviour:
+
+```bash
+pip install git+https://github.com/Knox-mgk/aibank
+```
+
+Either way you get two commands: `aibank`, the operator CLI, and `aibank-mcp`,
+the stdio server an agent runtime spawns. `pip install` pulls in **nothing
+else** — there are no dependencies, which is the point.
+
+It needs two secrets set or it refuses to boot, by design:
+
+```bash
+export AIBANK_ADMIN_KEY="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"
+export AIBANK_KEY_PEPPER="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"
+```
+
+Keep the pepper with your backups. A restored ledger without its pepper has no
+working agent keys.
+
+### Or clone it — one command from git to a running service
 
 ```bash
 git clone https://github.com/Knox-mgk/aibank
@@ -312,7 +343,7 @@ routine restart or a replica scale-up.
 ```bash
 export AIBANK_ALLOW_DEV_SECRETS=1 AIBANK_SCRYPT_N=1024
 
-# 128 unit tests (fake provider — no network, no credentials)
+# 148 unit tests (fake provider — no network, no credentials)
 python -m unittest discover -s tests
 
 # 338 assertions against REAL servers on real sockets
@@ -320,11 +351,23 @@ python scripts/smoke_http.py        #  74  the core API
 python scripts/smoke_mcp.py         #  82  the MCP tool surface
 python scripts/smoke_dashboard.py   # 138  the dashboard's endpoints + markup
 python scripts/smoke_dom.py         #  44  the dashboard's own JS, under node
+
+# 33 assertions on the DISTRIBUTION: build a wheel, install it into a clean
+# venv, and drive the installed copy. Needs network and ~300MB of scratch.
+pip install build && python scripts/smoke_package.py
 ```
 
 No install step, no requirements file — there are no dependencies.
 `smoke_dom` skips itself cleanly when node is absent; the others are the
 mandatory gate.
+
+`smoke_package` exists because packaging fails in ways no source-tree test can
+see. The dashboard is read off disk at request time, so a wheel missing
+`aibank/static/dashboard.html` serves a 404 on `GET /` while all 148 unit
+tests still pass; the console scripts are declared in `pyproject.toml` and
+never executed by a repo run. It builds, installs, and then runs the CLI and
+the server **from a different working directory**, so an accidental import of
+the source tree cannot mask a gap in the wheel.
 
 ### Operating it
 
@@ -519,9 +562,10 @@ GET    /health                            GET    /  ·  /dashboard  (the UI)
 | `deploy/nginx.conf` | TLS termination, edge rate limit, unspoofable `X-Forwarded-For` |
 | `deploy/systemd/` | unit plus sweep and backup timers, hardened |
 | `scripts/smoke_*.py` | 338 assertions against live servers |
+| `scripts/smoke_package.py` | 33 assertions against the built-and-installed wheel |
 | `scripts/dom_check.mjs` | runs the page's real JS against a minimal DOM |
 | `scripts/demo/` | one-command demo: fake provider, seeded data, no credential |
-| `tests/` | 128 tests, including the concurrency suite |
+| `tests/` | 148 tests, including the concurrency and packaging suites |
 
 ## Known limits
 
@@ -564,6 +608,11 @@ Stated plainly rather than discovered later:
 - **No metrics or structured logging.** `/health` reports the schema version,
   and `needs-reconciliation` exits 2 when a human is needed, which is enough to
   alert on but is not observability.
+- **Not published to PyPI yet.** The package builds, installs into a clean
+  venv and serves correctly (`scripts/smoke_package.py`, 33 assertions), and
+  `pip install aibank` is the documented path — but the name is unclaimed, so
+  that command does not work until the first upload. Until then, install from
+  the repo.
 - Not load-tested.
 
 ## Licence

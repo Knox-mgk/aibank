@@ -10,7 +10,10 @@ Run: python -m unittest discover -s tests
 from __future__ import annotations
 
 import os
+import shutil
+import sqlite3
 import sys
+import tempfile
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -48,6 +51,21 @@ class Base(unittest.TestCase):
                 _OPEN.pop().close()
             except Exception:
                 pass
+        while self._scratch:
+            shutil.rmtree(self._scratch.pop(), ignore_errors=True)
+
+    # Tests that need a directory on disk must take it from here, not from a
+    # bare `tempfile.mkdtemp`. Two backup tests did the latter and never
+    # removed it, so every suite run leaked two directories holding a copy of
+    # the ledger -- 38 of them, ~9MB, had accumulated in $TMPDIR on a host
+    # whose filesystem sits at 99% full. A test that cannot be run a thousand
+    # times is a slow leak with a passing status.
+    _scratch: list = []
+
+    def scratch(self) -> str:
+        d = tempfile.mkdtemp(prefix="aibank_bk_")
+        self._scratch.append(d)
+        return d
 
     def user(self, bank, email="kay@example.com", pw="correct-horse-battery"):
         u = U.create_user(bank, email, pw, "Kay")
@@ -774,9 +792,8 @@ class TestLedgerBackup(Base):
         self.bank.fund_agent(self.ag["agent_id"], "100000")
 
     def test_backup_is_verified_consistent_and_restorable(self):
-        import tempfile
         from aibank import db as D
-        dest = os.path.join(tempfile.mkdtemp(prefix="aibank_bk_"), "copy.db")
+        dest = os.path.join(self.scratch(), "copy.db")
 
         res = D.backup(self.bank.db.path, dest)
         self.assertTrue(res["ok"], res)
@@ -796,9 +813,8 @@ class TestLedgerBackup(Base):
     def test_backup_is_a_snapshot_not_a_live_view(self):
         """Writes after the copy must not appear in it, or 'backup' means
         nothing -- this is what distinguishes a snapshot from a symlink."""
-        import tempfile
         from aibank import db as D
-        dest = os.path.join(tempfile.mkdtemp(prefix="aibank_bk_"), "copy.db")
+        dest = os.path.join(self.scratch(), "copy.db")
         D.backup(self.bank.db.path, dest)
 
         before = self.bank.balance(self.ag["agent_id"])["balance_minor"]
@@ -1154,6 +1170,105 @@ class TestUnboundedPolicyDenies(Base):
             bank.request_payout(ag["agent_id"], "5000", bank_code="058",
                                 account_number="0690000031",
                                 idempotency_key="k3")
+
+
+class TestSuiteLeavesNoScratchBehind(Base):
+    """A test that leaks disk is a slow outage with a passing status.
+
+    Two backup tests used a bare `tempfile.mkdtemp` and never removed it, so
+    every run left two directories containing a full copy of the ledger. On
+    the development host -- a phone whose filesystem sits at 99% -- 38 had
+    piled up before anyone looked. Nothing in a green suite would ever have
+    reported it, which is why the invariant is asserted here rather than
+    trusted to review.
+    """
+
+    def test_scratch_dirs_are_removed_on_teardown(self):
+        d = self.scratch()
+        self.assertTrue(os.path.isdir(d))
+        self.assertIn(d, self._scratch)
+        # Prove tearDown is what removes it, by running the same body.
+        Base.tearDown(self)
+        self.assertFalse(os.path.exists(d),
+                         "scratch directory survived tearDown")
+
+    def test_only_the_scratch_helper_calls_mkdtemp(self):
+        """Guards the HABIT, not just today's two call sites.
+
+        The next test needing a directory will be written by copying a
+        neighbour, so the thing worth pinning is that no neighbour shows a
+        bare mkdtemp to copy. Checked by AST rather than by counting the
+        string, so prose in comments and docstrings cannot fail it.
+        """
+        import ast
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "test_users_and_policy.py")
+        with open(src, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), src)
+
+        offenders = []
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(fn):
+                if (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in ("mkdtemp", "mkstemp")
+                        and fn.name != "scratch"):
+                    offenders.append(f"{fn.name}:{node.lineno}")
+        self.assertEqual(offenders, [],
+                         "use self.scratch(); it is cleaned up in tearDown")
+
+
+class TestConnectionsActuallyClose(Base):
+    """`Database.close()` documented a guarantee it was not keeping.
+
+    Every thread that touches the database gets its own connection, and worker
+    threads exit without closing theirs -- which is precisely why `close()`
+    walks `_all_conns`. But sqlite3 refuses EVERY operation on a connection
+    from a foreign thread, `close()` included, and the `except sqlite3.Error`
+    in that loop swallowed the resulting ProgrammingError. So it closed the
+    caller's connection, silently failed on all the others, and returned as if
+    it had succeeded. Under the threaded HTTP server that is a file descriptor
+    and a WAL handle held per dead worker thread, for the life of the process.
+    """
+
+    def test_close_closes_connections_opened_by_other_threads(self):
+        bank, _ = make_bank()
+        opened = []
+        barrier = threading.Barrier(5)
+
+        def touch():
+            barrier.wait()
+            c = bank.db.conn
+            c.execute("select 1").fetchone()
+            opened.append(c)
+
+        threads = [threading.Thread(target=touch) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(len(opened), 5)
+        failed = bank.close()
+        self.assertEqual(failed, 0, "close() could not close every connection")
+
+        for c in opened:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                c.execute("select 1")
+
+    def test_close_reports_failures_instead_of_swallowing_them(self):
+        """The count is the point: a close that cannot close must say so.
+
+        Without a return value there is no difference, from the caller's side,
+        between closing eleven connections and closing none of them.
+        """
+        bank, _ = make_bank()
+        bank.db.conn.execute("select 1").fetchone()
+        self.assertEqual(bank.close(), 0)
+        # Idempotent: a second close has nothing left to do and still reports 0.
+        self.assertEqual(bank.close(), 0)
 
 
 if __name__ == "__main__":

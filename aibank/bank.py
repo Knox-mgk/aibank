@@ -129,7 +129,7 @@ class Bank:
         return self.db.write()
 
     def close(self):
-        self.db.close()
+        return self.db.close()
 
     # ---------- agents & auth ----------
     def create_agent(self, name: str, currency: str = "NGN", user_id: str | None = None,

@@ -15,6 +15,11 @@ compose.yaml
 Dockerfile
 README.md
 LICENSE
+MANIFEST.in
+pyproject.toml
+dist/
+build/
+*.egg-info/
 e2e.sh
 run_demo_server.py
 **/__pycache__/

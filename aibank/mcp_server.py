@@ -553,5 +553,28 @@ def build_server() -> Server:
     return Server(AibankClient(url, key))
 
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
+    """Console-script entry point (`aibank-mcp`).
+
+    Takes no arguments: an MCP runtime spawns this as a stdio child and
+    configures it purely through the environment (AIBANK_URL, AIBANK_API_KEY,
+    AIBANK_MCP_READONLY), so accepting flags here would only create a second,
+    divergent way to point it at a server.
+
+    `argv` defaults to `sys.argv[1:]` rather than to an empty list: a
+    setuptools console script calls `main()` with NO arguments, so defaulting
+    to empty made the guard below unreachable from the installed `aibank-mcp`
+    binary — the only way it is actually invoked.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv:
+        raise SystemExit(
+            "aibank-mcp takes no arguments; configure it with AIBANK_URL and "
+            "AIBANK_API_KEY in the environment.")
     build_server().serve_stdio()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
