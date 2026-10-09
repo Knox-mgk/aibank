@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aibank</title>
+<!--
+  One file, no build step, no CDN, no framework.
+
+  Why: this service is deliberately dependency-free and runs on hosts where
+  compiling a toolchain is not an option. A dashboard that needs npm would be
+  the only part of the system that cannot be deployed by copying a directory.
+  It is also a security property -- there is no third-party script on the page
+  that could read a session token.
+
+  The token lives in sessionStorage, not localStorage: it dies with the tab, so
+  a shared machine does not keep a live banking session after the window is
+  closed. A strict CSP is sent with this page (see api.py) and there is no
+  inline event handler anywhere, so an injected string cannot execute.
+-->
+<style>
+:root{
+  --bg:#0b0f14; --panel:#131a22; --panel2:#1a232e; --line:#243140;
+  --txt:#e6edf3; --dim:#8b9aab; --accent:#4fb3ff; --ok:#3fb950;
+  --warn:#d29922; --bad:#f85149; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);
+  font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+a{color:var(--accent)}
+header{display:flex;align-items:center;gap:12px;padding:14px 18px;
+  border-bottom:1px solid var(--line);background:var(--panel);
+  position:sticky;top:0;z-index:5;flex-wrap:wrap}
+header h1{font-size:17px;margin:0;letter-spacing:.5px}
+header .sp{flex:1}
+.muted{color:var(--dim)}
+.small{font-size:13px}
+.mono{font-family:var(--mono);font-size:12.5px}
+main{max-width:1000px;margin:0 auto;padding:18px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:16px;margin-bottom:16px}
+.card h2{font-size:14px;text-transform:uppercase;letter-spacing:.8px;
+  color:var(--dim);margin:0 0 12px}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+.col{flex:1;min-width:140px}
+label{display:block;font-size:12px;color:var(--dim);margin-bottom:4px}
+input,select{width:100%;padding:9px 10px;background:var(--panel2);
+  border:1px solid var(--line);border-radius:7px;color:var(--txt);font-size:14px}
+input:focus,select:focus{outline:1px solid var(--accent);border-color:var(--accent)}
+button{padding:9px 14px;border-radius:7px;border:1px solid var(--line);
+  background:var(--panel2);color:var(--txt);font-size:14px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);color:#06121d;border-color:var(--accent);
+  font-weight:600}
+button.danger{border-color:#5a2a2a;color:#ffb4ae}
+button:disabled{opacity:.5;cursor:default}
+.big{font-size:28px;font-weight:650;letter-spacing:-.5px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.tile{background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+  padding:12px}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th{text-align:left;color:var(--dim);font-weight:500;font-size:12px;
+  padding:6px 8px;border-bottom:1px solid var(--line)}
+td{padding:7px 8px;border-bottom:1px solid #1b2533;vertical-align:top}
+.pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11.5px;
+  border:1px solid var(--line)}
+.pill.ok{color:var(--ok);border-color:#1d4427}
+.pill.warn{color:var(--warn);border-color:#4a3a12}
+.pill.bad{color:var(--bad);border-color:#5a2a2a}
+.flash{padding:10px 12px;border-radius:8px;margin-bottom:12px;font-size:14px}
+.flash.err{background:#2a1416;border:1px solid #5a2a2a;color:#ffb4ae}
+.flash.ok{background:#11240f;border:1px solid #1d4427;color:#9ae6a0}
+.hidden{display:none!important}
+.agent{border:1px solid var(--line);border-radius:9px;margin-bottom:12px;
+  background:var(--panel2)}
+.agent .head{display:flex;gap:10px;align-items:center;padding:12px;
+  cursor:pointer;flex-wrap:wrap}
+.agent .body{padding:0 12px 12px;border-top:1px solid var(--line)}
+.kv{display:flex;gap:6px;font-size:12.5px;color:var(--dim)}
+.keybox{background:#0d2b16;border:1px solid #1d4427;border-radius:8px;
+  padding:10px;margin-top:10px;word-break:break-all}
+.tabs{display:flex;gap:6px;margin:10px 0}
+.tabs button{font-size:13px;padding:6px 10px}
+.tabs button[aria-selected=true]{border-color:var(--accent);color:var(--accent)}
+.center{max-width:380px;margin:60px auto}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ai<span style="color:var(--accent)">bank</span></h1>
+  <span id="whoami" class="muted small"></span>
+  <span class="sp"></span>
+  <span id="health" class="mono muted"></span>
+  <button id="refresh" class="hidden">Refresh</button>
+  <button id="logout" class="hidden">Sign out</button>
+</header>
+
+<main>
+  <div id="flash"></div>
+
+  <!-- ------------------------------------------------ auth -->
+  <section id="authview" class="center">
+    <div class="card">
+      <h2 id="authtitle">Sign in</h2>
+      <div style="margin-bottom:10px">
+        <label for="email">Email</label>
+        <input id="email" type="email" autocomplete="username">
+      </div>
+      <div style="margin-bottom:10px">
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password">
+      </div>
+      <div id="nameWrap" class="hidden" style="margin-bottom:10px">
+        <label for="dispname">Display name</label>
+        <input id="dispname" type="text">
+      </div>
+      <div class="row">
+        <button id="dologin" class="primary">Sign in</button>
+        <button id="toggleauth">Create an account</button>
+      </div>
+      <p class="small muted" style="margin-bottom:0">
+        Password must be at least 12 characters. Five failed attempts lock the
+        account for 15 minutes.
+      </p>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------ dashboard -->
+  <section id="dashview" class="hidden">
+
+    <div class="card">
+      <h2>Your wallet</h2>
+      <div class="row">
+        <div class="col">
+          <div class="muted small">Balance</div>
+          <div id="walBal" class="big">—</div>
+        </div>
+        <div class="col">
+          <div class="muted small">Allocated to agents</div>
+          <div id="walAlloc" class="big">—</div>
+        </div>
+        <div class="col">
+          <div class="muted small">Pending your approval</div>
+          <div id="walPending" class="big">—</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="approvalsCard">
+      <h2>Awaiting your approval</h2>
+      <div id="approvals"></div>
+    </div>
+
+    <div class="card">
+      <h2>Agents</h2>
+      <div id="agents"></div>
+      <details style="margin-top:12px">
+        <summary class="small muted" style="cursor:pointer">New agent</summary>
+        <div class="row" style="margin-top:10px">
+          <div class="col"><label for="naName">Name</label>
+            <input id="naName" placeholder="research-bot"></div>
+          <div class="col"><label for="naPerTxn">Per payment max</label>
+            <input id="naPerTxn" placeholder="50000"></div>
+          <div class="col"><label for="naDaily">Daily max</label>
+            <input id="naDaily" placeholder="200000"></div>
+          <div class="col"><label for="naApprove">Approve above</label>
+            <input id="naApprove" placeholder="25000"></div>
+          <div><button id="createAgent" class="primary">Create</button></div>
+        </div>
+        <p class="small muted">Limits are in major units (naira). Leave a field
+          blank for "no limit" — but an agent with no per-payment ceiling can
+          spend its entire wallet in one call.</p>
+      </details>
+    </div>
+
+    <div class="card">
+      <h2>Recent payments</h2>
+      <div id="payouts"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+/* ---------------------------------------------------------------- state */
+const S = {
+  token: sessionStorage.getItem("aibank_token") || "",
+  data: null,
+  open: new Set(JSON.parse(sessionStorage.getItem("aibank_open") || "[]")),
+  tab: {},
+};
+
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, txt) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (txt !== undefined) n.textContent = txt;   // textContent, never innerHTML
+  return n;
+};
+
+function flash(msg, kind) {
+  const f = $("flash");
+  f.replaceChildren();
+  if (!msg) return;
+  f.appendChild(el("div", "flash " + (kind || "err"), msg));
+  if (kind === "ok") setTimeout(() => f.replaceChildren(), 4000);
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+/* ------------------------------------------------------------- transport */
+async function api(method, path, body, opts) {
+  const o = opts || {};
+  const h = { "Accept": "application/json" };
+  if (body !== undefined) h["Content-Type"] = "application/json";
+  if (S.token && !o.anon) h["Authorization"] = "Bearer " + S.token;
+  if (o.idem) h["Idempotency-Key"] = o.idem;
+  let r;
+  try {
+    r = await fetch(path, {
+      method, headers: h,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch (e) {
+    throw new Error("cannot reach the service — is it running?");
+  }
+  const txt = await r.text();
+  let j = {};
+  try { j = txt ? JSON.parse(txt) : {}; } catch (e) { /* non-JSON body */ }
+  if (!r.ok) {
+    if (r.status === 401 && S.token && !o.anon) { signOut(true); }
+    const e = new Error(j.reason || j.error || ("HTTP " + r.status));
+    e.status = r.status;
+    throw e;
+  }
+  return j;
+}
+
+/* ------------------------------------------------------------ formatting */
+function money(v, cur) {
+  if (v === null || v === undefined) return "—";
+  const n = Number(v);
+  if (Number.isNaN(n)) return String(v);
+  return (cur ? cur + " " : "") +
+    n.toLocaleString(undefined, { minimumFractionDigits: 2,
+                                  maximumFractionDigits: 2 });
+}
+function when(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return Number.isNaN(+d) ? iso : d.toLocaleString();
+}
+const STATUS_CLASS = {
+  successful: "ok", submitted: "warn", pending_approval: "warn",
+  failed: "bad", rejected: "bad", refunded: "bad",
+  needs_reconciliation: "bad",
+};
+function statusPill(s) {
+  return el("span", "pill " + (STATUS_CLASS[s] || ""), (s || "?").replace(/_/g, " "));
+}
+
+/* ------------------------------------------------------------------ auth */
+let REGISTER_MODE = false;
+
+$("toggleauth").addEventListener("click", () => {
+  REGISTER_MODE = !REGISTER_MODE;
+  $("authtitle").textContent = REGISTER_MODE ? "Create an account" : "Sign in";
+  $("dologin").textContent = REGISTER_MODE ? "Create account" : "Sign in";
+  $("toggleauth").textContent = REGISTER_MODE ? "I have an account"
+                                              : "Create an account";
+  $("nameWrap").classList.toggle("hidden", !REGISTER_MODE);
+  flash("");
+});
+
+$("dologin").addEventListener("click", doAuth);
+$("password").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") doAuth();
+});
+
+async function doAuth() {
+  const email = $("email").value.trim();
+  const password = $("password").value;
+  if (!email || !password) return flash("Email and password are required.");
+  $("dologin").disabled = true;
+  try {
+    if (REGISTER_MODE) {
+      await api("POST", "/v1/auth/register",
+                { email, password, display_name: $("dispname").value.trim() },
+                { anon: true });
+      flash("Account created. Signing you in…", "ok");
+    }
+    const r = await api("POST", "/v1/auth/login", { email, password },
+                        { anon: true });
+    S.token = r.session_token;
+    sessionStorage.setItem("aibank_token", S.token);
+    $("password").value = "";
+    flash("");
+    await load();
+  } catch (e) {
+    flash(e.message);
+  } finally {
+    $("dologin").disabled = false;
+  }
+}
+
+function signOut(expired) {
+  S.token = "";
+  S.data = null;
+  sessionStorage.removeItem("aibank_token");
+  $("dashview").classList.add("hidden");
+  $("authview").classList.remove("hidden");
+  $("refresh").classList.add("hidden");
+  $("logout").classList.add("hidden");
+  $("whoami").textContent = "";
+  if (expired) flash("Your session expired. Sign in again.");
+}
+
+$("logout").addEventListener("click", async () => {
+  try { await api("POST", "/v1/auth/logout", {}); } catch (e) { /* ignore */ }
+  signOut(false);
+});
+$("refresh").addEventListener("click", () => load());
+
+/* ------------------------------------------------------------------ load */
+async function health() {
+  try {
+    const h = await api("GET", "/health", undefined, { anon: true });
+    $("health").textContent = "schema v" + h.schema;
+  } catch (e) {
+    $("health").textContent = "service unreachable";
+  }
+}
+
+async function load() {
+  if (!S.token) return signOut(false);
+  try {
+    S.data = await api("GET", "/v1/dashboard");
+  } catch (e) {
+    return flash(e.message);
+  }
+  $("authview").classList.add("hidden");
+  $("dashview").classList.remove("hidden");
+  $("refresh").classList.remove("hidden");
+  $("logout").classList.remove("hidden");
+  const u = S.data.user || {};
+  $("whoami").textContent = (u.display_name || u.email || "") +
+    (u.role === "admin" ? " · admin" : "");
+  renderWallet();
+  renderApprovals();
+  renderAgents();
+  renderPayouts();
+}
+
+/* ---------------------------------------------------------------- render */
+function renderWallet() {
+  const w = S.data.wallet || {};
+  $("walBal").textContent = money(w.balance, w.currency);
+  let alloc = 0;
+  (S.data.agents || []).forEach((a) => {
+    alloc += Number((a.balance || {}).balance || 0);
+  });
+  $("walAlloc").textContent = money(alloc, w.currency);
+  const pend = S.data.pending_approvals || [];
+  $("walPending").textContent = pend.length +
+    (pend.length === 1 ? " payment" : " payments");
+}
+
+function renderApprovals() {
+  const box = $("approvals");
+  box.replaceChildren();
+  const list = S.data.pending_approvals || [];
+  if (!list.length) {
+    $("approvalsCard").classList.add("hidden");
+    return;
+  }
+  $("approvalsCard").classList.remove("hidden");
+  list.forEach((p) => {
+    const t = el("div", "tile");
+    const top = el("div", "row");
+    const left = el("div", "col");
+    left.appendChild(el("div", "big", money(p.amount, p.currency)));
+    left.appendChild(el("div", "small muted",
+      "fee " + money(p.fee, p.currency) + " · agent " + (p.agent_name || p.agent_id)));
+    // The destination matters most on this card: approving is the one moment a
+    // human can catch an agent paying the wrong account.
+    left.appendChild(el("div", "small mono",
+      "to " + (p.destination || "unknown destination") +
+      (p.dest_bank_code ? " · bank " + p.dest_bank_code : "")));
+    if (p.narration) left.appendChild(el("div", "small", p.narration));
+    left.appendChild(el("div", "small muted", when(p.created_at)));
+    top.appendChild(left);
+
+    const act = el("div");
+    const ok = el("button", "primary", "Approve");
+    const no = el("button", "danger", "Reject");
+    ok.addEventListener("click", () => decide(p.id, "approve", ok, no));
+    no.addEventListener("click", () => decide(p.id, "reject", ok, no));
+    act.appendChild(ok);
+    act.appendChild(document.createTextNode(" "));
+    act.appendChild(no);
+    top.appendChild(act);
+    t.appendChild(top);
+    box.appendChild(t);
+  });
+}
+
+async function decide(id, what, ok, no) {
+  // Approving is irreversible once the provider accepts it, so confirm.
+  if (!window.confirm(
+      what === "approve"
+        ? "Approve this payment? Funds leave the agent's wallet immediately."
+        : "Reject this payment? The held funds are released back.")) return;
+  ok.disabled = no.disabled = true;
+  try {
+    await api("POST", "/v1/payouts/" + encodeURIComponent(id) + "/" + what, {});
+    flash("Payment " + what + "d.", "ok");
+    await load();
+  } catch (e) {
+    flash(e.message);
+    ok.disabled = no.disabled = false;
+  }
+}
+
+function renderAgents() {
+  const box = $("agents");
+  box.replaceChildren();
+  const list = S.data.agents || [];
+  if (!list.length) {
+    box.appendChild(el("p", "muted small",
+      "No agents yet. Create one below, then give its API key to the agent."));
+    return;
+  }
+  list.forEach((a) => box.appendChild(agentCard(a)));
+}
+
+function agentCard(a) {
+  const wrap = el("div", "agent");
+  const bal = a.balance || {};
+  const pol = a.policy || {};
+
+  const head = el("div", "head");
+  head.appendChild(el("strong", null, a.name || a.id));
+  head.appendChild(statusPill(a.status === "active" ? "successful" : "failed"));
+  if (a.status !== "active") head.lastChild.textContent = a.status;
+  else head.lastChild.textContent = "active";
+  head.appendChild(el("span", "sp"));
+  const bl = el("span", "mono muted");
+  bl.textContent = money(bal.available, bal.currency) + " available" +
+    (Number(bal.held || 0) ? "  ·  " + money(bal.held, bal.currency) + " held" : "");
+  head.appendChild(bl);
+  const caret = el("span", "muted", S.open.has(a.id) ? "▾" : "▸");
+  head.appendChild(caret);
+  wrap.appendChild(head);
+
+  const body = el("div", "body");
+  body.classList.toggle("hidden", !S.open.has(a.id));
+  head.addEventListener("click", () => {
+    if (S.open.has(a.id)) S.open.delete(a.id); else S.open.add(a.id);
+    sessionStorage.setItem("aibank_open", JSON.stringify([...S.open]));
+    body.classList.toggle("hidden");
+    caret.textContent = S.open.has(a.id) ? "▾" : "▸";
+    if (!body.classList.contains("hidden")) loadAgentDetail(a.id, body);
+  });
+
+  // tabs
+  const tabs = el("div", "tabs");
+  const panes = el("div");
+  const defs = [
+    ["limits", "Limits", () => paneLimits(a)],
+    ["funds", "Move funds", () => paneFunds(a)],
+    ["keys", "API keys", () => paneKeys(a)],
+    ["stmt", "Statement", () => paneStatement(a)],
+  ];
+  defs.forEach(([key, label, build]) => {
+    const b = el("button", null, label);
+    b.setAttribute("aria-selected", String((S.tab[a.id] || "limits") === key));
+    b.addEventListener("click", () => {
+      S.tab[a.id] = key;
+      [...tabs.children].forEach((c) =>
+        c.setAttribute("aria-selected", String(c === b)));
+      panes.replaceChildren(build());
+    });
+    tabs.appendChild(b);
+  });
+  body.appendChild(tabs);
+  const cur = S.tab[a.id] || "limits";
+  panes.replaceChildren((defs.find((d) => d[0] === cur) || defs[0])[2]());
+  body.appendChild(panes);
+  wrap.appendChild(body);
+  return wrap;
+}
+
+function num(v) { return (v === null || v === undefined || v === "") ? "" : String(v); }
+
+function paneLimits(a) {
+  const pol = a.policy || {};
+  const cur = pol.currency || "NGN";
+  const d = el("div");
+
+  d.appendChild(el("p", "small muted",
+    "These limits are enforced server-side on every payment. The agent's API " +
+    "key cannot read or change them — only this page can, and only with your " +
+    "password-backed session."));
+
+  const fields = [
+    ["per_txn_max", "Per payment max", pol.per_txn_max],
+    ["daily_max", "Daily max", pol.daily_max],
+    ["monthly_max", "Monthly max", pol.monthly_max],
+    ["require_approval_above", "Needs my approval above", pol.require_approval_above],
+    ["max_payouts_per_day", "Max payments per day", pol.max_payouts_per_day],
+  ];
+  const row = el("div", "row");
+  const inputs = {};
+  fields.forEach(([k, label, val]) => {
+    const c = el("div", "col");
+    c.appendChild(el("label", null, label));
+    const i = el("input");
+    i.value = num(val);
+    i.placeholder = "no limit";
+    inputs[k] = i;
+    c.appendChild(i);
+    row.appendChild(c);
+  });
+  d.appendChild(row);
+
+  const row2 = el("div", "row");
+  const c1 = el("div", "col");
+  c1.appendChild(el("label", null, "Payees"));
+  const sel = el("select");
+  [["false", "Any destination"], ["true", "Saved payees only"]].forEach(([v, t]) => {
+    const o = el("option", null, t); o.value = v; sel.appendChild(o);
+  });
+  sel.value = String(!!pol.allowlist_only);
+  c1.appendChild(sel);
+  row2.appendChild(c1);
+
+  const c2 = el("div", "col");
+  c2.appendChild(el("label", null, "Day resets at (UTC offset, minutes)"));
+  const tz = el("input");
+  tz.value = num(pol.tz_offset_minutes !== undefined ? pol.tz_offset_minutes : 60);
+  c2.appendChild(tz);
+  row2.appendChild(c2);
+  d.appendChild(row2);
+  d.appendChild(el("p", "small muted",
+    "Lagos is 60. If this is wrong the daily cap resets at the wrong hour and " +
+    "the agent gets a second day's allowance inside one day."));
+
+  const save = el("button", "primary", "Save limits");
+  save.addEventListener("click", async () => {
+    const body = { currency: cur, allowlist_only: sel.value === "true" };
+    Object.entries(inputs).forEach(([k, i]) => {
+      const v = i.value.trim();
+      if (v !== "") body[k] = v;
+    });
+    const t = tz.value.trim();
+    if (t !== "") body.tz_offset_minutes = Number(t);
+    save.disabled = true;
+    try {
+      await api("POST", "/v1/agents/" + encodeURIComponent(a.id) + "/policy", body);
+      flash("Limits saved.", "ok");
+      await load();
+    } catch (e) { flash(e.message); save.disabled = false; }
+  });
+  d.appendChild(save);
+
+  const fz = el("button", a.status === "frozen" ? "" : "danger",
+                a.status === "frozen" ? "Unfreeze agent" : "Freeze agent");
+  fz.style.marginLeft = "8px";
+  fz.addEventListener("click", async () => {
+    const freeze = a.status !== "frozen";
+    if (freeze && !window.confirm(
+        "Freeze " + (a.name || a.id) + "? It stops being able to spend immediately."))
+      return;
+    fz.disabled = true;
+    try {
+      await api("POST", "/v1/agents/" + encodeURIComponent(a.id) + "/freeze",
+                { frozen: freeze });
+      flash(freeze ? "Agent frozen." : "Agent unfrozen.", "ok");
+      await load();
+    } catch (e) { flash(e.message); fz.disabled = false; }
+  });
+  d.appendChild(fz);
+  return d;
+}
+
+function paneFunds(a) {
+  const bal = a.balance || {};
+  const cur = bal.currency || "NGN";
+  const d = el("div");
+  d.appendChild(el("p", "small muted",
+    "Allocating moves money from your wallet into the agent's wallet. The " +
+    "agent can only ever spend what you allocated, under the limits above."));
+  const row = el("div", "row");
+  const c = el("div", "col");
+  c.appendChild(el("label", null, "Amount (" + cur + ")"));
+  const amt = el("input");
+  amt.placeholder = "10000.00";
+  c.appendChild(amt);
+  row.appendChild(c);
+
+  const mk = (label, path, cls) => {
+    const b = el("button", cls, label);
+    b.addEventListener("click", async () => {
+      const v = amt.value.trim();
+      if (!v) return flash("Enter an amount.");
+      b.disabled = true;
+      try {
+        // Idempotency key is derived, so a double-click cannot move the money
+        // twice: the second request returns the first entry.
+        const idem = path + "-" + a.id + "-" + v + "-" + Math.floor(Date.now() / 10000);
+        await api("POST", "/v1/agents/" + encodeURIComponent(a.id) + "/" + path,
+                  { amount: v, currency: cur, idempotency_key: idem });
+        flash("Done.", "ok");
+        amt.value = "";
+        await load();
+      } catch (e) { flash(e.message); } finally { b.disabled = false; }
+    });
+    return b;
+  };
+  const acts = el("div");
+  acts.appendChild(mk("Allocate →", "allocate", "primary"));
+  acts.appendChild(document.createTextNode(" "));
+  acts.appendChild(mk("← Withdraw", "withdraw"));
+  row.appendChild(acts);
+  d.appendChild(row);
+  return d;
+}
+
+function paneKeys(a) {
+  const d = el("div");
+  d.appendChild(el("p", "small muted",
+    "A key is shown once, at creation. Give it to the agent process; if it " +
+    "leaks, revoke it here and issue another — revoking takes effect on the " +
+    "next request."));
+  const tbl = el("table");
+  const hr = el("tr");
+  ["Prefix", "Label", "Created", "State", ""].forEach((h) =>
+    hr.appendChild(el("th", null, h)));
+  tbl.appendChild(hr);
+  (a._keys || []).forEach((k) => {
+    const tr = el("tr");
+    tr.appendChild(el("td", "mono", k.key_prefix));
+    tr.appendChild(el("td", null, k.label || "—"));
+    tr.appendChild(el("td", "small muted", when(k.created_at)));
+    const st = el("td");
+    st.appendChild(k.revoked_at ? el("span", "pill bad", "revoked")
+                                : el("span", "pill ok", "active"));
+    tr.appendChild(st);
+    const act = el("td");
+    if (!k.revoked_at) {
+      const b = el("button", "danger", "Revoke");
+      b.addEventListener("click", async () => {
+        if (!window.confirm("Revoke " + k.key_prefix +
+            "…? Any agent using it stops working immediately.")) return;
+        b.disabled = true;
+        try {
+          await api("POST", "/v1/agents/" + encodeURIComponent(a.id) + "/keys",
+                    { revoke: k.key_prefix });
+          flash("Key revoked.", "ok");
+          await refreshAgent(a.id);
+        } catch (e) { flash(e.message); b.disabled = false; }
+      });
+      act.appendChild(b);
+    }
+    tr.appendChild(act);
+    tbl.appendChild(tr);
+  });
+  d.appendChild(tbl);
+
+  const row = el("div", "row");
+  row.style.marginTop = "10px";
+  const c = el("div", "col");
+  c.appendChild(el("label", null, "Label for a new key"));
+  const lab = el("input");
+  lab.placeholder = "laptop-agent";
+  c.appendChild(lab);
+  row.appendChild(c);
+  const b = el("button", "primary", "Issue key");
+  b.addEventListener("click", async () => {
+    b.disabled = true;
+    try {
+      const r = await api("POST", "/v1/agents/" + encodeURIComponent(a.id) + "/keys",
+                          { label: lab.value.trim() || null });
+      const box = el("div", "keybox");
+      box.appendChild(el("div", "small", "Copy this now — it is not shown again:"));
+      box.appendChild(el("div", "mono", r.api_key));
+      d.appendChild(box);
+      flash("Key issued.", "ok");
+      await refreshAgent(a.id);
+    } catch (e) { flash(e.message); } finally { b.disabled = false; }
+  });
+  row.appendChild(b);
+  d.appendChild(row);
+  return d;
+}
+
+function paneStatement(a) {
+  const d = el("div");
+  d.appendChild(el("p", "small muted",
+    "Every posting against this agent's wallet — funding, allocations, " +
+    "payments, fees and reversals — with a running balance."));
+  const host = el("div");
+  d.appendChild(host);
+  host.appendChild(el("p", "muted small", "Loading…"));
+  api("GET", "/v1/agents/" + encodeURIComponent(a.id) + "/statement?limit=50")
+    .then((st) => {
+      host.replaceChildren();
+      const lines = st.lines || [];
+      if (!lines.length) {
+        host.appendChild(el("p", "muted small", "No movements yet."));
+        return;
+      }
+      const tbl = el("table");
+      const hr = el("tr");
+      ["When", "Kind", "Memo", "Amount", "Balance"].forEach((h) =>
+        hr.appendChild(el("th", null, h)));
+      tbl.appendChild(hr);
+      lines.slice().reverse().forEach((l) => {
+        const tr = el("tr");
+        tr.appendChild(el("td", "small muted", when(l.created_at)));
+        tr.appendChild(el("td", null, (l.kind || "").replace(/_/g, " ")));
+        tr.appendChild(el("td", "small", l.memo || l.reference || "—"));
+        const amt = el("td", "mono", money(l.amount, ""));
+        amt.style.color = Number(l.amount) < 0 ? "var(--bad)" : "var(--ok)";
+        tr.appendChild(amt);
+        tr.appendChild(el("td", "mono muted", money(l.running, "")));
+        tbl.appendChild(tr);
+      });
+      host.appendChild(tbl);
+    })
+    .catch((e) => {
+      host.replaceChildren();
+      host.appendChild(el("p", "flash err", e.message));
+    });
+  return d;
+}
+
+async function loadAgentDetail(agentId, body) {
+  const a = (S.data.agents || []).find((x) => x.id === agentId);
+  if (!a || a._keys) return;
+  try {
+    const det = await api("GET", "/v1/agents/" + encodeURIComponent(agentId));
+    a._keys = det.keys || [];
+    a._payees = det.payees || [];
+    const fresh = agentCard(a);
+    body.replaceChildren(...fresh.querySelector(".body").childNodes);
+  } catch (e) { flash(e.message); }
+}
+
+async function refreshAgent(agentId) {
+  const a = (S.data.agents || []).find((x) => x.id === agentId);
+  if (a) delete a._keys;
+  await load();
+  S.open.add(agentId);
+}
+
+function renderPayouts() {
+  const box = $("payouts");
+  box.replaceChildren();
+  const list = S.data.recent_payouts || [];
+  if (!list.length) {
+    box.appendChild(el("p", "muted small", "No payments yet."));
+    return;
+  }
+  const tbl = el("table");
+  const hr = el("tr");
+  ["When", "Amount", "Fee", "To", "Status", "Narration", ""].forEach((h) =>
+    hr.appendChild(el("th", null, h)));
+  tbl.appendChild(hr);
+  list.forEach((p) => {
+    const tr = el("tr");
+    tr.appendChild(el("td", "small muted", when(p.created_at)));
+    tr.appendChild(el("td", "mono", money(p.amount, p.currency)));
+    tr.appendChild(el("td", "mono muted", money(p.fee, "")));
+    tr.appendChild(el("td", "mono muted", p.destination || "—"));
+    const st = el("td");
+    st.appendChild(statusPill(p.status));
+    tr.appendChild(st);
+    tr.appendChild(el("td", "small", p.narration || "—"));
+    const act = el("td");
+    if (p.status === "submitted") {
+      const b = el("button", null, "Reconcile");
+      b.title = "Ask the provider what actually happened to this payment.";
+      b.addEventListener("click", async () => {
+        b.disabled = true;
+        try {
+          const r = await api("POST",
+            "/v1/payouts/" + encodeURIComponent(p.id) + "/reconcile", {});
+          flash("Provider says: " + (r.status || "unknown"), "ok");
+          await load();
+        } catch (e) { flash(e.message); b.disabled = false; }
+      });
+      act.appendChild(b);
+    } else if (p.status === "successful") {
+      const b = el("button", "danger", "Refund");
+      b.addEventListener("click", async () => {
+        if (!window.confirm("Record a refund for this payment? It posts a " +
+            "reversing entry — it does not pull money back from the recipient."))
+          return;
+        b.disabled = true;
+        try {
+          await api("POST", "/v1/payouts/" + encodeURIComponent(p.id) + "/refund",
+                    { reason: "refunded from dashboard" });
+          flash("Refund posted.", "ok");
+          await load();
+        } catch (e) { flash(e.message); b.disabled = false; }
+      });
+      act.appendChild(b);
+    }
+    tr.appendChild(act);
+    tbl.appendChild(tr);
+  });
+  box.appendChild(tbl);
+}
+
+/* ------------------------------------------------------------ new agent */
+$("createAgent").addEventListener("click", async () => {
+  const b = $("createAgent");
+  const body = { name: $("naName").value.trim() || "agent", currency: "NGN",
+                 tz_offset_minutes: 60 };
+  const map = { naPerTxn: "per_txn_max", naDaily: "daily_max",
+                naApprove: "require_approval_above" };
+  Object.entries(map).forEach(([id, key]) => {
+    const v = $(id).value.trim();
+    if (v !== "") body[key] = v;
+  });
+  b.disabled = true;
+  try {
+    const r = await api("POST", "/v1/agents", body);
+    await load();
+    const box = el("div", "keybox");
+    box.appendChild(el("div", "small",
+      "Agent created. This API key is shown once — copy it now:"));
+    box.appendChild(el("div", "mono", r.api_key));
+    $("flash").replaceChildren(box);
+    ["naName", "naPerTxn", "naDaily", "naApprove"].forEach((i) => ($(i).value = ""));
+  } catch (e) { flash(e.message); } finally { b.disabled = false; }
+});
+
+/* ------------------------------------------------------------------ boot */
+health();
+if (S.token) load(); else signOut(false);
+</script>
+</body>
+</html>

@@ -28,6 +28,29 @@ def _db_path(args) -> str:
     return args.db or os.environ.get("AIBANK_DB", "aibank.db")
 
 
+def _require_head(conn, path: str) -> None:
+    """Refuse to run against a database that is not at head, with a readable
+    message naming the fix.
+
+    Without this, every subcommand on a fresh or stale database raised a raw
+    `sqlite3.OperationalError: no such table: postings` traceback -- which tells
+    an operator nothing about the actual problem (the schema was never applied)
+    and nothing about the one-word remedy. A CLI that answers "wrong schema"
+    with a stack trace will be read as "the tool is broken".
+    """
+    have = D.current_version(conn)
+    if have == D.SCHEMA_VERSION:
+        return
+    if have == 0:
+        raise SystemExit(
+            f"error: {path} has no aibank schema.\n"
+            f"       run:  python -m aibank.cli migrate")
+    raise SystemExit(
+        f"error: {path} is at schema v{have}; this code expects "
+        f"v{D.SCHEMA_VERSION}.\n"
+        f"       run:  python -m aibank.cli migrate")
+
+
 def cmd_migrate(args) -> int:
     path = _db_path(args)
     conn = D.connect(path)
@@ -58,8 +81,10 @@ def cmd_version(args) -> int:
 
 
 def cmd_trial_balance(args) -> int:
-    conn = D.connect(_db_path(args))
+    path = _db_path(args)
+    conn = D.connect(path)
     try:
+        _require_head(conn, path)
         net = L.trial_balance(conn, args.currency)
         print(f"net={net} {'balanced' if net == 0 else 'CORRUPT'}")
         return 0 if net == 0 else 1
@@ -97,7 +122,17 @@ def cmd_sweep(args) -> int:
 
 def cmd_serve(args) -> int:
     from .api import serve
-    serve(_db_path(args), args.host, args.port)
+    path = _db_path(args)
+    conn = D.connect(path)
+    try:
+        # Checked here so an out-of-date database produces a one-line message
+        # naming the fix, rather than a RuntimeError traceback out of the
+        # Database constructor. `serve()` enforces the same thing on its own
+        # for callers that import it directly.
+        _require_head(conn, path)
+    finally:
+        conn.close()
+    serve(path, args.host, args.port)
     return 0
 
 

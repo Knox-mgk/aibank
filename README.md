@@ -8,8 +8,11 @@ request a payout that the server either allows, holds for approval, or denies.
 
 **Zero third-party dependencies.** Python standard library only, by design.
 
+It ships both ends of that: a **dashboard** for the human and an **MCP server**
+so the agent spends through typed tools instead of hand-rolled HTTP.
+
 ```
-92 unit tests + 74 live HTTP assertions, 0 failures
+117 unit tests + 338 live assertions against real servers, 0 failures
 ```
 
 ---
@@ -175,6 +178,21 @@ Each of these was reproduced by a test before being fixed, and the test remains:
   error. Both now fail closed.
 - **Currency was never cross-checked** between payout and payee: a USD payout
   to an NGN account is a ~1,500x error, not a conversion.
+- **A payout to a raw destination could never be approved.** Payments to a
+  saved payee were fine, but one sent straight to a bank code and account
+  number recorded no destination, so the approval path had nothing to submit:
+  any such payment above the approval threshold parked and then froze the funds
+  until the sweeper expired the hold. Schema v3 records the destination on the
+  payout itself — which is the right shape regardless, since a payout record
+  that cannot say where it was sending money is not an audit trail.
+- **The limits form would have erased the limits.** `get_policy` returned only
+  `*_minor` integer columns while the dashboard reads decimal fields, so every
+  configured ceiling rendered as an empty input — which reads as "no limit" —
+  and saving the form would have silently removed them. Found by asserting the
+  inputs were pre-filled, not by asserting the endpoint returned 200.
+- **Three tests hard-coded `schema_version == 2`.** Adding v3 failed them for
+  no reason; they now assert against `db.SCHEMA_VERSION`. A test that must be
+  edited by every migration is a test that will eventually be edited wrongly.
 
 ---
 
@@ -184,15 +202,20 @@ Each of these was reproduced by a test before being fixed, and the test remains:
 git clone https://github.com/Knox-mgk/aibank
 cd aibank
 
-# Unit tests (uses a fake provider — no network, no credentials)
-AIBANK_ALLOW_DEV_SECRETS=1 AIBANK_SCRYPT_N=1024 \
-  python -m unittest discover -s tests
+export AIBANK_ALLOW_DEV_SECRETS=1 AIBANK_SCRYPT_N=1024
 
-# End-to-end HTTP test against a real server on a real socket
-python scripts/smoke_http.py
+# 117 unit tests (fake provider — no network, no credentials)
+python -m unittest discover -s tests
+
+# 338 assertions against REAL servers on real sockets
+python scripts/smoke_http.py        #  74  the core API
+python scripts/smoke_mcp.py         #  82  the MCP tool surface
+python scripts/smoke_dashboard.py   # 138  the dashboard's endpoints + markup
+python scripts/smoke_dom.py         #  44  the dashboard's own JS, under node
 ```
 
-No install step, no requirements file — there are no dependencies.
+No install step, no requirements file — there are no dependencies. `smoke_dom`
+skips itself cleanly when node is absent; the others are the mandatory gate.
 
 ### Operating it
 
@@ -214,9 +237,82 @@ The service **refuses to boot** without `AIBANK_ADMIN_KEY` and
 `AIBANK_KEY_PEPPER`. For local work only, `AIBANK_ALLOW_DEV_SECRETS=1` restores
 the old insecure defaults.
 
-Schema changes are never applied implicitly at boot: `migrate` is a deliberate
-command, and every migration runs in one transaction with a
-`PRAGMA foreign_key_check` afterwards.
+Schema changes are never applied implicitly at boot. `serve` opens the database
+with `migrate_on_open=False` and **refuses to start** against a schema it does
+not expect, naming `migrate` as the fix — starting a new binary against an old
+database is exactly when an unreviewed, unbacked-up `ALTER` is most dangerous.
+`migrate` is the deliberate step, and every migration runs in one transaction
+with a `PRAGMA foreign_key_check` afterwards. A test asserts this, because the
+guarantee was documented here for a while before the code actually kept it.
+
+## The MCP server — `pay()` as a typed tool
+
+An LLM does not call this API with hand-rolled HTTP; it calls eight typed tools
+over MCP stdio (`python -m aibank.mcp_server`):
+
+```
+whoami        get_balance    list_payees    add_payee
+quote_fee     pay            get_payout     list_payouts
+```
+
+```bash
+AIBANK_URL=http://127.0.0.1:8000 \
+AIBANK_API_KEY=sk_agent_... \
+  python -m aibank.mcp_server          # stdio JSON-RPC 2.0, protocol 2025-06-18
+```
+
+Three decisions worth stating, because they are what makes this safe to hand a
+model:
+
+- **The MCP process speaks HTTP; it never imports `Bank`.** An in-process bank
+  would hand the model's host process a live SQLite handle, and therefore write
+  access to the `policies` table — every limit the human set would be one stray
+  tool implementation away from being raised by the thing it constrains. Over a
+  socket, the agent credential is rejected on every policy and approval route
+  before a handler runs. `tests/test_mcp.py` asserts that structurally against
+  the module's own source, so a future tool cannot quietly reintroduce it.
+- **The human gate is server-side, not client-side.** MCP says a client SHOULD
+  let a human deny an invocation. On a bank that cannot be the only control: a
+  client that chooses not to prompt would silently remove it. Here
+  `require_approval_above` parks the payout in `pending_approval` and no
+  sequence of tool calls can release it. A client prompt is a second line.
+- **Refusals are returned as readable text, not just codes.** A denied payment
+  explains the limit it hit and tells the model explicitly not to retry and not
+  to split the amount — the machine-readable `code` is preserved alongside it.
+  Without that, a model's natural next move after a 403 is to try again smaller,
+  which is exactly how a daily cap gets walked around by salami-slicing.
+
+`AIBANK_MCP_READONLY=1` drops every money-moving tool from `tools/list`
+entirely rather than refusing it at call time: a tool the model cannot see is a
+tool it cannot be talked into trying.
+
+## The dashboard
+
+`GET /` serves one file — `aibank/static/dashboard.html`, ~31KB of plain
+HTML/CSS/JS. No build step, no bundler, no CDN, no framework. The whole UI is
+one `GET /v1/dashboard` call: wallet, agents with their policies, pending
+approvals, recent payments.
+
+- Sign in, fund the wallet, allocate to an agent, set its limits, approve or
+  reject what it parked, rotate its keys, read its statement.
+- The session token lives in `sessionStorage`, not `localStorage` — it dies with
+  the tab.
+- A strict CSP is sent with the page and there are no external `script`/`link`
+  tags, so there is nothing to exfiltrate a token to.
+- Approval cards show the **masked** destination (`******0031`). The one moment
+  a human can catch an agent paying the wrong account is at approval, so the
+  destination is recorded on the payout itself rather than looked up from a
+  saved payee.
+
+Testing a UI without a browser on the host is the awkward part, so it is done in
+two layers. `smoke_dashboard.py` proves every endpoint the page calls is
+reachable, returns the fields the page reads, and that all 17 call sites in the
+page are exercised. `smoke_dom.py` goes further: it extracts the page's
+`<script>`, runs it under node against a minimal DOM shim pointed at a real
+server, and asserts the element tree that results — that the page's code
+actually executes, renders real data, and that clicking Approve or Allocate
+issues the right request with an idempotency key. Neither proves the page
+*looks* right; they prove it is not blank.
 
 ## HTTP surface
 
@@ -240,7 +336,7 @@ POST   /v1/payouts/<id>/refund           POST   /v1/payouts/<id>/reconcile
 
 GET/POST /v1/fees                 (admin)  POST /v1/admin/sweep-holds  (admin)
 GET    /v1/admin/trial-balance    (admin)  POST /v1/webhooks/flutterwave
-GET    /health
+GET    /health                            GET    /  ·  /dashboard  (the UI)
 ```
 
 ## Layout
@@ -257,8 +353,11 @@ GET    /health
 | `aibank/money.py` | integer minor units, currency validation |
 | `aibank/api.py` | HTTP surface, three trust domains |
 | `aibank/cli.py` | migrate / serve / sweep / create-user |
-| `scripts/smoke_http.py` | 74 assertions against a live server |
-| `tests/` | 92 tests, including the concurrency suite |
+| `aibank/mcp_server.py` | MCP stdio server — `pay()` as a typed LLM tool |
+| `aibank/static/dashboard.html` | the whole dashboard: one file, no build step |
+| `scripts/smoke_*.py` | 338 assertions against live servers |
+| `scripts/dom_check.mjs` | runs the page's real JS against a minimal DOM |
+| `tests/` | 117 tests, including the concurrency suite |
 
 ## Known limits
 
@@ -276,6 +375,13 @@ Stated plainly rather than discovered later:
   of a beneficiary's account; the reversal records that it came back.
 - **Inbound collections are not implemented.** `/v1/wallet/deposit` is
   admin-gated and stands in for a real virtual-account callback.
+- **The dashboard has never been opened in a real browser.** There is none on
+  the host it was written on. Its JS is executed under node against a DOM shim,
+  which proves the code runs and renders — not that the layout is right in
+  Safari. Treat the first real browser session as a test still owed.
+- **The dashboard is served over plain HTTP by `http.server`.** Put it behind a
+  TLS-terminating reverse proxy before it leaves localhost; a session token on
+  the wire in clear is the whole account.
 - Not load-tested.
 
 ## Licence

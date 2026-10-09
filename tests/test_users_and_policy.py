@@ -56,9 +56,64 @@ class Base(unittest.TestCase):
 
 
 class TestMigrations(Base):
+    """These assert against db.SCHEMA_VERSION, never a literal.
+
+    Three of these tests hard-coded `2` and all three broke the moment a v3
+    migration landed -- a failing suite that says nothing about whether the
+    migration is correct. Deriving the expectation from the migration list
+    keeps the test about the PROPERTY (a fresh database is at head, migrations
+    are stamped and idempotent) instead of about today's version number.
+    """
+
     def test_fresh_db_is_at_head(self):
+        from aibank import db as D
         bank, _ = make_bank()
-        self.assertEqual(bank.schema_version(), 2)
+        self.assertEqual(bank.schema_version(), D.SCHEMA_VERSION)
+
+    def test_serve_refuses_to_migrate_a_production_schema_at_boot(self):
+        """The README promises schema changes are never applied implicitly at
+        boot. `serve()` was nonetheless constructing `Bank(db_path)` with the
+        auto-migrate DEFAULT, so starting a new binary against an old database
+        would have silently rewritten it -- precisely when an unreviewed,
+        unbacked-up ALTER is most dangerous.
+
+        Asserted at two levels: that the guarantee holds behaviourally, and
+        that `serve` passes the flag, so restoring the default is a test
+        failure rather than a silent regression of a documented promise.
+        """
+        import inspect
+
+        from aibank import api as A
+        from aibank import db as D
+
+        path = D.ephemeral_path()
+        conn = D.connect(path)
+        try:
+            # Build a v1-only database: behind head, exactly like a host that
+            # has taken new code but not yet been migrated.
+            conn.executescript("BEGIN;\n" + D.MIGRATION_1)
+            conn.execute("CREATE TABLE IF NOT EXISTS schema_version ("
+                         "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+            conn.execute("INSERT INTO schema_version VALUES (1, 'x')")
+            conn.commit()
+        finally:
+            conn.close()
+
+        with self.assertRaises(RuntimeError) as cm:
+            Bank(path, flw=FlutterwaveClient(secret_key="FLWSECK_TEST-x",
+                                             opener=FakeFLW()),
+                 migrate_on_open=False)
+        self.assertIn("cli migrate", str(cm.exception))
+
+        # And the schema was NOT touched by the attempt.
+        conn = D.connect(path)
+        try:
+            self.assertEqual(D.current_version(conn), 1)
+        finally:
+            conn.close()
+            os.unlink(path)
+
+        self.assertIn("migrate_on_open=False", inspect.getsource(A.serve))
 
     def test_migration_is_atomic_and_stamped(self):
         """Regression: executescript() issues an implicit COMMIT, which used to
@@ -68,10 +123,11 @@ class TestMigrations(Base):
         from aibank import db as D
         conn = D.connect(":memory:")
         try:
+            every = [v for v, _sql in D.MIGRATIONS]
             applied = D.migrate(conn)
-            self.assertEqual(applied, [1, 2])
+            self.assertEqual(applied, every)
             rows = conn.execute("SELECT version FROM schema_version ORDER BY version").fetchall()
-            self.assertEqual([r[0] for r in rows], [1, 2])
+            self.assertEqual([r[0] for r in rows], every)
             # Re-running is a no-op, not an error.
             self.assertEqual(D.migrate(conn), [])
         finally:
@@ -101,11 +157,169 @@ class TestMigrations(Base):
 
         bank = Bank(path, flw=FlutterwaveClient(secret_key="k", opener=FakeFLW()))
         _OPEN.append(bank)
-        self.assertEqual(bank.schema_version(), 2)
+        from aibank import db as D
+        self.assertEqual(bank.schema_version(), D.SCHEMA_VERSION)
         # The v2 rebuild of `accounts` must have carried the row (and its
         # postings, by id) across the DROP/RENAME.
         self.assertEqual(bank.balance("agent_old")["balance_minor"], 77700)
         self.assertTrue(bank.trial_balance()["balanced"])
+
+    def test_v3_backfills_the_destination_from_the_payee(self):
+        """A v2 payout's destination must survive into the v3 column.
+
+        Without the backfill, every payout written before v3 would be
+        unapprovable after the upgrade -- the exact failure v3 exists to fix,
+        reintroduced for historical rows.
+        """
+        from aibank import db as D
+        conn = D.connect(":memory:")
+        try:
+            # Build v1+v2 only, then seed a payout with a payee, then migrate.
+            #
+            # The versions must be STAMPED after applying them by hand: the
+            # runner infers v1 from the presence of `agents` but has no way to
+            # see that v2 already ran, so it would re-apply v2's ALTERs and die
+            # on "duplicate column name".
+            conn.execute("CREATE TABLE IF NOT EXISTS schema_version ("
+                         " version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+            for version, sql in D.MIGRATIONS:
+                if version > 2:
+                    break
+                conn.executescript("BEGIN;\n" + sql)
+                conn.execute("INSERT INTO schema_version (version, applied_at)"
+                             " VALUES (?, '2026-01-01T00:00:00+00:00')", (version,))
+                conn.execute("COMMIT")
+            conn.execute("INSERT INTO agents (id,name,status,created_at)"
+                         " VALUES ('agent_1','a','active','2026-01-01T00:00:00+00:00')")
+            conn.execute("INSERT INTO payees (id,agent_id,label,bank_code,"
+                         "account_number,currency,created_at) VALUES"
+                         " ('payee_1','agent_1','V','058','0690000031','NGN',"
+                         "'2026-01-01T00:00:00+00:00')")
+            conn.execute(
+                "INSERT INTO payouts (id,agent_id,payee_id,amount_minor,fee_minor,"
+                "currency,status,reference,created_at,updated_at) VALUES"
+                " ('payout_1','agent_1','payee_1',1000,0,'NGN','pending_approval',"
+                "'ref_1','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00')")
+            conn.commit()
+
+            D.migrate(conn)
+            row = conn.execute(
+                "SELECT dest_bank_code, dest_account_number FROM payouts"
+                " WHERE id='payout_1'").fetchone()
+            self.assertEqual(row["dest_bank_code"], "058")
+            self.assertEqual(row["dest_account_number"], "0690000031")
+        finally:
+            conn.close()
+
+
+class TestPayoutDestination(Base):
+    """A parked payout must remain approvable, and must not leak the account.
+
+    The bug: `approve_payout` re-resolved the destination by joining `payees`,
+    which is NULL when the agent paid a raw bank_code/account_number. Those
+    payouts could never be approved -- the funds sat held with no route
+    forward and no record of where they were going.
+    """
+
+    def _setup(self):
+        bank, _ = make_bank()
+        u = U.create_user(bank, "owner@example.com", "correct-horse-battery")
+        ag = bank.create_agent("a", user_id=u["user_id"],
+                               require_approval_above="100")
+        bank.deposit_to_user(u["user_id"], "100000", idempotency_key="d")
+        bank.allocate_to_agent(u["user_id"], ag["agent_id"], "50000",
+                               idempotency_key="al")
+        return bank, u, ag
+
+    def test_raw_destination_payout_can_still_be_approved(self):
+        bank, u, ag = self._setup()
+        out = bank.request_payout(ag["agent_id"], "5000", bank_code="058",
+                                  account_number="0690000031",
+                                  idempotency_key="k1")
+        self.assertEqual(out["status"], "pending_approval")
+        self.assertIsNone(out["payee_id"])
+        done = bank.approve_payout(out["id"], user_id=u["user_id"])
+        self.assertIn(done["status"], ("submitted", "successful"))
+        self.assertTrue(bank.trial_balance()["balanced"])
+
+    def test_destination_is_pinned_at_request_time(self):
+        """Editing the payee while a payout waits must not redirect the money."""
+        bank, u, ag = self._setup()
+        pid = bank.add_payee(ag["agent_id"], "V", "058", "0690000031")
+        out = bank.request_payout(ag["agent_id"], "5000", payee_id=pid,
+                                  idempotency_key="k2")
+        self.assertEqual(out["status"], "pending_approval")
+        with bank.db.write() as conn:
+            conn.execute("UPDATE payees SET account_number='9999999999'"
+                         " WHERE id=?", (pid,))
+        row = bank.conn.execute(
+            "SELECT dest_account_number FROM payouts WHERE id=?",
+            (out["id"],)).fetchone()
+        self.assertEqual(row["dest_account_number"], "0690000031")
+
+    def test_account_number_is_masked_in_the_api_view(self):
+        bank, u, ag = self._setup()
+        out = bank.request_payout(ag["agent_id"], "50", bank_code="058",
+                                  account_number="0690000031",
+                                  idempotency_key="k3")
+        self.assertEqual(out["destination"], "******0031")
+        self.assertNotIn("dest_account_number", out)
+        # And nowhere in the serialised payload either.
+        import json
+        self.assertNotIn("0690000031", json.dumps(out, default=str))
+        listed = bank.list_payouts(agent_id=ag["agent_id"])
+        self.assertNotIn("0690000031", json.dumps(listed, default=str))
+
+
+class TestPolicyRepresentation(Base):
+    """`get_policy` must return display values, not only `*_minor` columns.
+
+    The dashboard reads `per_txn_max`; when only `per_txn_max_minor` existed,
+    a configured ceiling rendered as an empty form field -- i.e. as "no limit" --
+    and saving that form back would have ERASED the limit. A silent widening of
+    the agent's authority through the UI that was meant to constrain it.
+    """
+
+    def test_policy_exposes_major_units_for_every_limit(self):
+        bank, _ = make_bank()
+        ag = bank.create_agent("a", per_txn_max="500", daily_max="1000",
+                               require_approval_above="250")
+        pol = bank.get_policy(ag["agent_id"])
+        self.assertEqual(pol["per_txn_max"], "500.00")
+        self.assertEqual(pol["daily_max"], "1000.00")
+        self.assertEqual(pol["require_approval_above"], "250.00")
+        # Minor units stay available for exactness.
+        self.assertEqual(pol["per_txn_max_minor"], 50000)
+
+    def test_unset_limit_is_none_not_zero(self):
+        """Zero would read as "may not spend at all"; None means unlimited."""
+        bank, _ = make_bank()
+        ag = bank.create_agent("a", per_txn_max="500")
+        pol = bank.get_policy(ag["agent_id"])
+        self.assertIsNone(pol["monthly_max"])
+        self.assertIsNone(pol["monthly_max_minor"])
+
+    def test_round_tripping_the_form_preserves_the_limits(self):
+        """Read the policy, write it straight back, assert nothing widened."""
+        bank, _ = make_bank()
+        u = U.create_user(bank, "rt@example.com", "correct-horse-battery")
+        ag = bank.create_agent("a", user_id=u["user_id"], per_txn_max="500",
+                               daily_max="1000", max_payouts_per_day=3)
+        before = bank.get_policy(ag["agent_id"])
+        bank.set_policy(ag["agent_id"], currency=before["currency"],
+                        per_txn_max=before["per_txn_max"],
+                        daily_max=before["daily_max"],
+                        monthly_max=before["monthly_max"],
+                        require_approval_above=before["require_approval_above"],
+                        max_payouts_per_day=before["max_payouts_per_day"],
+                        allowlist_only=bool(before["allowlist_only"]),
+                        tz_offset_minutes=before["tz_offset_minutes"],
+                        user_id=u["user_id"])
+        after = bank.get_policy(ag["agent_id"])
+        for field in ("per_txn_max_minor", "daily_max_minor",
+                      "monthly_max_minor", "require_approval_above_minor",
+                      "max_payouts_per_day", "tz_offset_minutes"):
+            self.assertEqual(before[field], after[field], field)
 
 
 class TestAuth(Base):

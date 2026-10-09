@@ -80,10 +80,34 @@ class NotFound(BankError):
     """
 
 
+def _mask_account(num: str | None) -> str | None:
+    """Last four digits only. Full account numbers are not display data.
+
+    `get_payout` and the dashboard return these rows to a browser and into
+    logs; a complete account number in that path is a disclosure with no
+    upside, since nothing in the UI needs more than enough to recognise it.
+    """
+    if not num:
+        return None
+    s = str(num)
+    return ("*" * max(0, len(s) - 4)) + s[-4:]
+
+
+def _payout_view(row, currency: str | None = None) -> dict:
+    """The API representation of a payout row."""
+    d = dict(row)
+    cur = currency or d.get("currency") or "NGN"
+    d["amount"] = to_major(d["amount_minor"], cur)
+    d["fee"] = to_major(d["fee_minor"], cur)
+    acct = d.pop("dest_account_number", None)
+    d["destination"] = _mask_account(acct)
+    return d
+
+
 class Bank:
     def __init__(self, db_path: str = "aibank.db", flw: FlutterwaveClient | None = None,
-                 callback_url: str | None = None):
-        self.db = Database(db_path)
+                 callback_url: str | None = None, migrate_on_open: bool = True):
+        self.db = Database(db_path, migrate_on_open=migrate_on_open)
         self.flw = flw or FlutterwaveClient()
         self.callback_url = callback_url or os.environ.get("AIBANK_CALLBACK_URL")
 
@@ -257,8 +281,27 @@ class Bank:
             self._write_policy(conn, agent_id, currency=currency, **kw)
 
     def get_policy(self, agent_id: str) -> dict | None:
+        """An agent's limits, in BOTH minor units and decimal major units.
+
+        The stored columns are `*_minor` integers, which is correct for the
+        ledger and wrong for a form: a dashboard reading `per_txn_max` got
+        `undefined` and rendered a configured ceiling as an empty field -- i.e.
+        as "no limit". Saving that form back would then erase the limit the
+        human had set, which is a silent widening of the agent's authority.
+
+        So the API representation carries both: `*_minor` for exactness, and
+        the decimal string for display. `None` means genuinely unlimited.
+        """
         row = P.get_policy(self.conn, agent_id)
-        return dict(row) if row else None
+        if not row:
+            return None
+        d = dict(row)
+        cur = d.get("currency") or "NGN"
+        for field in ("per_txn_max", "daily_max", "monthly_max",
+                      "require_approval_above"):
+            minor = d.get(field + "_minor")
+            d[field] = None if minor is None else to_major(minor, cur)
+        return d
 
     def wallet_id(self, agent_id: str, currency: str = "NGN") -> str:
         return L.get_or_create_account(self.conn, agent_id, "agent_wallet", currency)
@@ -453,10 +496,12 @@ class Bank:
                 ts = L.now_iso()
                 conn.execute(
                     "INSERT INTO payouts (id, agent_id, payee_id, amount_minor, fee_minor,"
-                    " currency, status, reference, hold_id, narration, created_at, updated_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " currency, status, reference, hold_id, narration,"
+                    " dest_bank_code, dest_account_number, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (payout_id, agent_id, payee_id, minor, fee_minor, currency, status,
-                     reference, hold_id, narration or None, ts, ts),
+                     reference, hold_id, narration or None,
+                     bank_code, account_number, ts, ts),
                 )
                 L.audit(conn, agent_id, "payout.request", status,
                         {"payout_id": payout_id, "amount_minor": minor,
@@ -493,10 +538,26 @@ class Bank:
             raise NotFound("unknown payout")
         if p["status"] != "pending_approval":
             raise BankError(f"payout is {p['status']}, not awaiting approval")
-        payee = self.conn.execute(
-            "SELECT * FROM payees WHERE id = ?", (p["payee_id"],)).fetchone()
-        if not payee:
-            raise BankError("payout has no resolvable payee")
+
+        # The destination is read from the PAYOUT, not re-resolved from the
+        # payee. Two reasons, both found the hard way:
+        #   1. A payout to a raw bank_code/account_number has no payee row, so
+        #      the old join returned nothing and the human could not approve it
+        #      at all -- the money stayed held with no route forward.
+        #   2. Even with a payee, re-resolving means the destination can CHANGE
+        #      between request and approval (the agent edits the payee while the
+        #      payment waits), so the human would approve one destination and
+        #      the money would go to another. Pinning it at request time makes
+        #      the approval mean what it says.
+        bank_code = p["dest_bank_code"]
+        account_number = p["dest_account_number"]
+        if not (bank_code and account_number):
+            # Pre-v3 rows with neither a destination nor a payee.
+            payee = self.conn.execute(
+                "SELECT * FROM payees WHERE id = ?", (p["payee_id"],)).fetchone()
+            if not payee:
+                raise BankError("payout has no recorded destination to send to")
+            bank_code, account_number = payee["bank_code"], payee["account_number"]
         with self.db.write() as conn:
             conn.execute(
                 "UPDATE payouts SET approved_by=?, approved_at=?, decided_reason=?,"
@@ -504,7 +565,7 @@ class Bank:
                 (user_id, L.now_iso(), reason, L.now_iso(), payout_id))
             L.audit(conn, p["agent_id"], "payout.approve", "ok",
                     {"payout_id": payout_id}, user_id=user_id)
-        return self._submit(payout_id, payee["bank_code"], payee["account_number"],
+        return self._submit(payout_id, bank_code, account_number,
                             narration or p["narration"] or "")
 
     def reject_payout(self, payout_id: str, user_id: str | None = None,
@@ -532,13 +593,7 @@ class Bank:
             " JOIN agents a ON a.id = p.agent_id"
             " WHERE a.user_id = ? AND p.status = 'pending_approval'"
             " ORDER BY p.created_at", (user_id,)).fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            d["amount"] = to_major(r["amount_minor"], r["currency"])
-            d["fee"] = to_major(r["fee_minor"], r["currency"])
-            out.append(d)
-        return out
+        return [_payout_view(r) for r in rows]
 
     def refund_payout(self, payout_id: str, user_id: str | None = None,
                       reason: str = "refund") -> dict:
@@ -696,10 +751,7 @@ class Bank:
         p = self.conn.execute(sql, tuple(args)).fetchone()
         if not p:
             raise NotFound("unknown payout")
-        d = dict(p)
-        d["amount"] = to_major(p["amount_minor"], p["currency"])
-        d["fee"] = to_major(p["fee_minor"], p["currency"])
-        return d
+        return _payout_view(p)
 
     def list_payouts(self, agent_id: str | None = None, user_id: str | None = None,
                      status: str | None = None, limit: int = 50,
@@ -717,13 +769,8 @@ class Bank:
             args.append(status)
         sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
         args += [max(1, min(int(limit), 200)), max(0, int(offset))]
-        out = []
-        for r in self.conn.execute(sql, tuple(args)).fetchall():
-            d = dict(r)
-            d["amount"] = to_major(r["amount_minor"], r["currency"])
-            d["fee"] = to_major(r["fee_minor"], r["currency"])
-            out.append(d)
-        return out
+        return [_payout_view(r)
+                for r in self.conn.execute(sql, tuple(args)).fetchall()]
 
     def statement(self, agent_id: str, currency: str = "NGN", limit: int = 100,
                   offset: int = 0) -> dict:

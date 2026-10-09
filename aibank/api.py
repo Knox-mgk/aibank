@@ -21,6 +21,7 @@ import json
 import os
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import fees as F
@@ -31,6 +32,23 @@ from .ledger import LedgerError, InsufficientFunds, DuplicateIdempotencyKey
 from .money import MoneyError
 
 SECRET_HASH = os.environ.get("FLW_SECRET_HASH", "")
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# The dashboard holds a live banking session, so the page is locked down rather
+# than merely trusted: no external origin may be fetched, no plugin may load,
+# and the page may not be framed (clickjacking an "Approve" button is exactly
+# the attack that matters here). `unsafe-inline` is present for style/script
+# because the dashboard is deliberately one self-contained file with no build
+# step -- which is also why there is no third-party origin to allow.
+CSP = ("default-src 'none'; "
+       "script-src 'self' 'unsafe-inline'; "
+       "style-src 'self' 'unsafe-inline'; "
+       "connect-src 'self'; "
+       "img-src 'self' data:; "
+       "base-uri 'none'; "
+       "form-action 'none'; "
+       "frame-ancestors 'none'")
 
 _ADMIN_KEY: str | None = None
 
@@ -61,6 +79,39 @@ def make_handler(bank: Bank):
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self._security_headers()
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _security_headers(self):
+            self.send_header("Content-Security-Policy", CSP)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Frame-Options", "DENY")
+            # A banking response must never be cached by a proxy or left in a
+            # shared browser cache for the next person at the machine.
+            self.send_header("Cache-Control", "no-store")
+
+        def _send_static(self, name: str):
+            """Serve the dashboard. One fixed allowlist, no path arithmetic.
+
+            Traversal is impossible by construction rather than by sanitising:
+            the request path is matched against a dict of known routes, and the
+            filename never comes from user input.
+            """
+            allowed = {"dashboard.html": "text/html; charset=utf-8"}
+            ctype = allowed.get(name)
+            if ctype is None:
+                return self._send(404, {"error": "not found"})
+            path = STATIC_DIR / name
+            try:
+                body = path.read_bytes()
+            except OSError:
+                return self._send(500, {"error": "dashboard asset missing"})
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self._security_headers()
             self.end_headers()
             self.wfile.write(body)
 
@@ -125,6 +176,9 @@ def make_handler(bank: Bank):
             q = self._query(raw_path)
             try:
                 # ---------------- public ----------------
+                if path in ("/", "/dashboard") and method == "GET":
+                    return self._send_static("dashboard.html")
+
                 if path == "/health":
                     return self._send(200, {"ok": True, "service": "aibank",
                                             "schema": bank.schema_version()})
@@ -451,10 +505,22 @@ def make_handler(bank: Bank):
 
 
 def serve(db_path: str = "aibank.db", host: str = "127.0.0.1", port: int = 8000):
-    bank = Bank(db_path)
+    # migrate_on_open=False: the service must NEVER alter a production schema
+    # as a side effect of a deploy. Starting a new binary against an old
+    # database is exactly when an unreviewed, unbacked-up ALTER is most
+    # dangerous, so it refuses to boot and names the command instead. `python
+    # -m aibank.cli migrate` is the deliberate, auditable upgrade step.
+    bank = Bank(db_path, migrate_on_open=False)
     admin_key()  # fail fast at boot rather than on the first admin request
     httpd = ThreadingHTTPServer((host, port), make_handler(bank))
     print(f"aibank listening on http://{host}:{port}  (db={db_path})")
+    print(f"  dashboard: http://{host}:{port}/")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        # The dashboard posts a password and carries a session token. Over
+        # plain HTTP on a routable interface both are readable on the wire.
+        print("  WARNING: bound to a non-loopback address over plain HTTP. "
+              "Put a TLS-terminating reverse proxy in front of this before "
+              "anyone signs in from another machine.")
     httpd.serve_forever()
 
 

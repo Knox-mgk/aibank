@@ -82,7 +82,9 @@ for _ in range(50):
 print("\n-- public --")
 s, b = call("GET", "/health")
 check("health 200", s, 200)
-check("health reports schema v2", b.get("schema"), 2)
+# Pinned to db.SCHEMA_VERSION, never a literal: a hard-coded version turns
+# every future migration into a false test failure.
+check("health reports the current schema", b.get("schema"), D.SCHEMA_VERSION)
 check("unknown route 404", call("GET", "/v1/nope")[0], 404)
 
 print("\n-- registration & login --")

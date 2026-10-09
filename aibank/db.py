@@ -316,9 +316,33 @@ ALTER TABLE audit_log ADD COLUMN user_id TEXT;
 ALTER TABLE audit_log ADD COLUMN ip TEXT;
 """
 
+# v3: record the DESTINATION on the payout itself.
+#
+# Found by the dashboard end-to-end test, and it was a dead end for real money:
+# a payout to a raw bank_code/account_number (no saved payee) parked for
+# approval, and `approve_payout` then resolved the destination by joining
+# `payees` -- which is NULL for that path. So the human could never approve it,
+# the funds stayed held until the sweeper, and the only recorded trace of where
+# the money was meant to go was the in-flight request body.
+#
+# Storing the destination on the payout is the right shape regardless: a payout
+# record that cannot say where it was sending money is not an audit trail.
+MIGRATION_3 = """
+ALTER TABLE payouts ADD COLUMN dest_bank_code TEXT;
+ALTER TABLE payouts ADD COLUMN dest_account_number TEXT;
+
+-- Backfill from the payee for every historical payout that had one.
+UPDATE payouts SET
+    dest_bank_code = (SELECT bank_code FROM payees WHERE payees.id = payouts.payee_id),
+    dest_account_number = (SELECT account_number FROM payees
+                           WHERE payees.id = payouts.payee_id)
+WHERE payee_id IS NOT NULL;
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, MIGRATION_1),
     (2, MIGRATION_2),
+    (3, MIGRATION_3),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
