@@ -1,0 +1,14 @@
+[Unit]
+Description=aibank — verified ledger backup every 6 hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+AccuracySec=5min
+# Survive downtime: if the host was off at the scheduled moment, take the
+# backup on the next boot rather than silently skipping a window.
+Persistent=true
+Unit=aibank-backup.service
+
+[Install]
+WantedBy=timers.target

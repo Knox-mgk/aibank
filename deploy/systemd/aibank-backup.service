@@ -1,0 +1,31 @@
+[Unit]
+Description=aibank — verified ledger backup
+Documentation=https://github.com/Knox-mgk/aibank
+After=aibank.service
+
+[Service]
+Type=oneshot
+User=aibank
+Group=aibank
+WorkingDirectory=/opt/aibank
+EnvironmentFile=/etc/aibank.env
+Environment=AIBANK_DB=/var/lib/aibank/aibank.db
+
+# `backup` uses SQLite's online backup API, so this is safe to run while the
+# service is live -- and it OPENS the copy afterwards to check integrity, the
+# schema version and the trial balance. A backup nobody has read back is a
+# hope, not a backup, so a bad copy fails the unit instead of sitting in the
+# directory looking like protection.
+ExecStart=/usr/bin/python3 -m aibank.cli backup --dir /var/backups/aibank
+
+# Keep 28. At four a day that is a week of history -- enough to notice a
+# corruption that was introduced days before anyone looked.
+ExecStartPost=/bin/sh -c 'ls -1t /var/backups/aibank/aibank-*.db 2>/dev/null | tail -n +29 | xargs -r rm -f'
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/aibank /var/backups/aibank
+UMask=0077
+LimitCORE=0

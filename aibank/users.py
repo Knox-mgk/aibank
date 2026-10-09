@@ -35,6 +35,13 @@ SCRYPT_LEN = 32
 SESSION_TTL_HOURS = int(os.environ.get("AIBANK_SESSION_TTL_HOURS", 12))
 LOCKOUT_WINDOW_MIN = int(os.environ.get("AIBANK_LOCKOUT_WINDOW_MIN", 15))
 LOCKOUT_THRESHOLD = int(os.environ.get("AIBANK_LOCKOUT_THRESHOLD", 8))
+# Per-SOURCE-ADDRESS threshold, deliberately higher than the per-account one:
+# a NAT'd office or a shared mobile gateway puts many legitimate users behind
+# one address, so this has to tolerate several people fumbling passwords while
+# still cutting off a sprayer. It is a ceiling on attack RATE, not an identity
+# check -- an attacker with a botnet gets one bucket per source, which is why
+# the per-account threshold stays in place underneath it.
+IP_LOCKOUT_THRESHOLD = int(os.environ.get("AIBANK_IP_LOCKOUT_THRESHOLD", 30))
 MIN_PASSWORD_LEN = 10
 
 # A fixed salt for the dummy hash burned when an email does not exist.
@@ -160,6 +167,24 @@ def _recent_failures(conn, email: str, nowdt: datetime) -> int:
     return int(row["n"])
 
 
+def _recent_failures_by_ip(conn, ip: str | None, nowdt: datetime) -> int:
+    """Failed attempts from one source address, across ALL accounts.
+
+    WHY this exists alongside the per-email counter: per-account lockout does
+    nothing against password SPRAYING -- one common password tried once each
+    against a thousand accounts never trips any single account's threshold, and
+    every attempt is a free scrypt run on our CPU. The attack is cheap for the
+    attacker and expensive for us, which is backwards.
+    """
+    if not ip or ip == "?":
+        return 0
+    since = (nowdt - timedelta(minutes=LOCKOUT_WINDOW_MIN)).isoformat()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM login_attempts"
+        " WHERE client_ip=? AND ok=0 AND created_at >= ?", (ip, since)).fetchone()
+    return int(row["n"])
+
+
 def _record_attempt(conn, email: str, ip: str | None, ok: bool) -> None:
     conn.execute(
         "INSERT INTO login_attempts (email, client_ip, ok, created_at) VALUES (?,?,?,?)",
@@ -203,6 +228,18 @@ def login(db, email: str, password: str, client_ip: str | None = None,
     nowdt = datetime.now(timezone.utc)
 
     # Read the throttle state and the user first; no writes yet.
+    #
+    # The per-IP check runs BEFORE any scrypt call, including the dummy one.
+    # That ordering is the point: it makes a flood cost the attacker a SQL
+    # COUNT instead of a key derivation, so hammering this endpoint can no
+    # longer be used to burn our CPU. Checked before the per-email counter
+    # because the spraying attacker never trips that one at all.
+    if _recent_failures_by_ip(db.conn, client_ip, nowdt) >= IP_LOCKOUT_THRESHOLD:
+        _record_failure(db, email, client_ip)
+        raise LockedOut(
+            f"too many failed sign-ins from this address; try again in "
+            f"{LOCKOUT_WINDOW_MIN} minutes")
+
     if _recent_failures(db.conn, email, nowdt) >= LOCKOUT_THRESHOLD:
         _record_failure(db, email, client_ip)
         raise LockedOut(

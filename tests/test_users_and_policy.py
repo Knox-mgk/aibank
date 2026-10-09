@@ -730,6 +730,214 @@ class TestRefundsAndSweeper(Base):
             "SELECT expires_at FROM holds ORDER BY created_at DESC LIMIT 1").fetchone()
         self.assertIsNotNone(row["expires_at"])
 
+    def _expire_and_sweep(self, out):
+        past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        self.bank.conn.execute(
+            "UPDATE holds SET expires_at=? WHERE status='active'", (past,))
+        return self.bank.sweep_expired_holds()
+
+    def test_swept_payout_appears_on_the_reconciliation_report(self):
+        """The sweeper's refusal to guess creates an operator task; it has to
+        be LISTABLE or the task is lost in a column nobody reads."""
+        out = self.bank.request_payout(self.ag["agent_id"], "5000", payee_id=self.payee)
+        self.assertEqual(self.bank.needs_reconciliation(), [])
+
+        self._expire_and_sweep(out)
+        rows = self.bank.needs_reconciliation()
+        self.assertEqual([r["id"] for r in rows], [out["id"]])
+
+    def test_reconciliation_report_drops_items_once_resolved(self):
+        """A late webhook settles the payout. It must leave the report, or an
+        operator chases a closed item -- and the historical failure_reason
+        string stays on the record, so status has to be in the predicate."""
+        out = self.bank.request_payout(self.ag["agent_id"], "5000", payee_id=self.payee)
+        self._expire_and_sweep(out)
+        self.assertEqual(len(self.bank.needs_reconciliation()), 1)
+
+        self.bank.handle_webhook({"event": "transfer.completed",
+            "data": {"id": 99, "reference": out["reference"], "status": "SUCCESSFUL"}})
+
+        self.assertEqual(self.bank.needs_reconciliation(), [])
+        row = self.bank.conn.execute(
+            "SELECT failure_reason FROM payouts WHERE id=?", (out["id"],)).fetchone()
+        self.assertIn("needs reconciliation", row["failure_reason"] or "")
+
+
+class TestLedgerBackup(Base):
+    """A self-hosting operator has no backup unless we ship one."""
+
+    def setUp(self):
+        self.bank, self.fake = make_bank()
+        self.u, self.s = self.user(self.bank)
+        self.ag = self.bank.create_agent("spender", user_id=self.u["user_id"],
+                                         daily_max="1000000")
+        self.bank.fund_agent(self.ag["agent_id"], "100000")
+
+    def test_backup_is_verified_consistent_and_restorable(self):
+        import tempfile
+        from aibank import db as D
+        dest = os.path.join(tempfile.mkdtemp(prefix="aibank_bk_"), "copy.db")
+
+        res = D.backup(self.bank.db.path, dest)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["integrity"], "ok")
+        self.assertEqual(res["trial_balance"], 0)
+        self.assertEqual(res["schema_version"], D.SCHEMA_VERSION)
+        self.assertGreater(res["bytes"], 0)
+
+        # Restorable means a Bank opens it at head and the money is there --
+        # not merely that a file of nonzero size exists.
+        restored = Bank(dest, flw=FlutterwaveClient(secret_key="FLWSECK_TEST-x",
+                                                    opener=self.fake))
+        _OPEN.append(restored)
+        self.assertEqual(restored.balance(self.ag["agent_id"])["balance_minor"],
+                         self.bank.balance(self.ag["agent_id"])["balance_minor"])
+
+    def test_backup_is_a_snapshot_not_a_live_view(self):
+        """Writes after the copy must not appear in it, or 'backup' means
+        nothing -- this is what distinguishes a snapshot from a symlink."""
+        import tempfile
+        from aibank import db as D
+        dest = os.path.join(tempfile.mkdtemp(prefix="aibank_bk_"), "copy.db")
+        D.backup(self.bank.db.path, dest)
+
+        before = self.bank.balance(self.ag["agent_id"])["balance_minor"]
+        self.bank.fund_agent(self.ag["agent_id"], "50000")
+        self.assertGreater(self.bank.balance(self.ag["agent_id"])["balance_minor"], before)
+
+        restored = Bank(dest, flw=FlutterwaveClient(secret_key="FLWSECK_TEST-x",
+                                                    opener=self.fake))
+        _OPEN.append(restored)
+        self.assertEqual(restored.balance(self.ag["agent_id"])["balance_minor"], before)
+
+
+class TestLoginRateLimiting(Base):
+    """Per-account lockout does nothing against spraying one password across
+    many accounts -- each account sees a single failure and we pay for every
+    scrypt call."""
+
+    def setUp(self):
+        self.bank, self.fake = make_bank()
+
+    def test_spraying_many_accounts_from_one_address_is_throttled(self):
+        for i in range(5):
+            U.create_user(self.bank, f"u{i}@example.com", "correct-horse-battery")
+
+        locked_at = None
+        for n in range(U.IP_LOCKOUT_THRESHOLD + 5):
+            email = f"u{n % 5}@example.com"
+            try:
+                U.login(self.bank, email, "wrong-password-entirely",
+                        client_ip="203.0.113.9")
+            except U.LockedOut:
+                locked_at = n
+                break
+            except U.AuthError:
+                continue
+        self.assertIsNotNone(
+            locked_at, "spraying was never throttled by source address")
+        assert locked_at is not None
+        self.assertLessEqual(locked_at, U.IP_LOCKOUT_THRESHOLD + 1)
+
+        # No individual account hit its own threshold -- which is the point.
+        for i in range(5):
+            n = self.bank.conn.execute(
+                "SELECT COUNT(*) AS n FROM login_attempts"
+                " WHERE email=? AND ok=0", (f"u{i}@example.com",)).fetchone()["n"]
+            self.assertLess(n, U.LOCKOUT_THRESHOLD)
+
+    def test_a_lockout_on_one_address_cannot_lock_out_another(self):
+        """The bucket must be keyed on source, not global. If it were global,
+        one attacker would deny service to every legitimate user -- turning our
+        own defence into the outage. Proven by a SUCCESSFUL login from a clean
+        address while the attacker's address is locked."""
+        U.create_user(self.bank, "victim@example.com", "correct-horse-battery")
+        U.create_user(self.bank, "elsewhere@example.com", "correct-horse-battery")
+
+        # Burn the attacker's address past its threshold on a nonexistent
+        # account, so no real account's own counter is involved at all.
+        for _ in range(U.IP_LOCKOUT_THRESHOLD + 2):
+            try:
+                U.login(self.bank, "nobody@example.com", "wrong",
+                        client_ip="203.0.113.9")
+            except U.AuthError:
+                pass
+        with self.assertRaises(U.LockedOut):
+            U.login(self.bank, "victim@example.com", "correct-horse-battery",
+                    client_ip="203.0.113.9")
+
+        # Clean address, correct password: must still work.
+        s = U.login(self.bank, "elsewhere@example.com", "correct-horse-battery",
+                    client_ip="198.51.100.4")
+        self.assertTrue(s.get("session_token"))
+
+    def test_the_ip_check_runs_before_any_key_derivation(self):
+        """Ordering IS the defence: if scrypt ran first, a flood would still
+        burn our CPU on every rejected attempt."""
+        import inspect
+        src = inspect.getsource(U.login)
+        ip_check = src.index("_recent_failures_by_ip")
+        first_scrypt = src.index("_scrypt(password")
+        self.assertLess(
+            ip_check, src.index("_recent_failures(db.conn"),
+            "per-IP throttle must be checked before the per-email one")
+        # The dummy scrypt for unknown emails sits further down the function;
+        # the throttle must precede it.
+        self.assertLess(ip_check, src.rindex("_scrypt(password"))
+        self.assertGreater(first_scrypt, 0)
+
+
+class TestForwardedForIsNotTrustedByDefault(Base):
+    """The per-address throttle is only as sound as the address it keys on.
+
+    Two opposite failures are possible and both are bad: behind a proxy,
+    keying on the socket address puts every user in ONE bucket (one sprayer
+    locks out the world), while trusting a client-supplied X-Forwarded-For
+    gives an attacker unlimited fresh buckets and lets them frame any address
+    in the audit log. The resolution is an explicit operator assertion.
+    """
+
+    def _resolve(self, headers: dict, trust: bool) -> str:
+        """Drive api._client_ip without standing up a socket."""
+        from aibank import api as A
+
+        class FakeHeaders(dict):
+            def get(self, k, d=None):
+                for key, v in self.items():
+                    if key.lower() == k.lower():
+                        return v
+                return d
+
+        bank, _ = make_bank()
+        handler_cls = A.make_handler(bank)
+        h = handler_cls.__new__(handler_cls)        # no __init__: it would serve
+        h.client_address = ("10.9.9.9", 51234)
+        h.headers = FakeHeaders(headers)   # type: ignore[assignment]
+        saved = A._TRUST_PROXY
+        A._TRUST_PROXY = trust
+        try:
+            return handler_cls._client_ip(h)
+        finally:
+            A._TRUST_PROXY = saved
+
+    def test_header_is_ignored_unless_the_operator_opts_in(self):
+        got = self._resolve({"X-Forwarded-For": "1.2.3.4"}, trust=False)
+        self.assertEqual(got, "10.9.9.9",
+                         "a client-set header must not choose its own throttle bucket")
+
+    def test_header_is_used_when_the_deployment_asserts_a_proxy(self):
+        got = self._resolve({"X-Forwarded-For": "1.2.3.4"}, trust=True)
+        self.assertEqual(got, "1.2.3.4")
+
+    def test_leftmost_entry_wins_so_appended_values_cannot_hide_the_client(self):
+        got = self._resolve({"X-Forwarded-For": "1.2.3.4, 10.0.0.7"}, trust=True)
+        self.assertEqual(got, "1.2.3.4")
+
+    def test_falls_back_to_the_socket_when_the_header_is_absent_or_empty(self):
+        self.assertEqual(self._resolve({}, trust=True), "10.9.9.9")
+        self.assertEqual(self._resolve({"X-Forwarded-For": "  "}, trust=True),
+                         "10.9.9.9")
+
 
 class TestFees(Base):
     def setUp(self):

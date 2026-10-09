@@ -651,6 +651,29 @@ class Bank:
                         {"hold_id": h["id"], "amount_minor": h["amount_minor"]})
         return {"released": released, "needs_reconciliation": flagged}
 
+    def needs_reconciliation(self, limit: int = 200) -> list[dict]:
+        """Payouts the sweeper released but could not resolve.
+
+        `sweep_expired_holds` deliberately refuses to declare an unanswered
+        payout failed -- the money may well have left. That correctness choice
+        creates an OPERATOR obligation: someone must ask the provider what
+        actually happened. Until this existed, that obligation was recorded in
+        a `failure_reason` string nobody queried, so the sweeper was writing
+        tickets into a drawer that was never opened.
+
+        Non-terminal status is part of the predicate, not just the reason text:
+        a payout later settled by a late webhook or resolved by `reconcile`
+        keeps its historical reason, and re-listing it would send an operator
+        chasing a closed item.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM payouts"
+            " WHERE failure_reason LIKE '%needs reconciliation%'"
+            "   AND status NOT IN ('successful','failed','rejected','refunded')"
+            " ORDER BY created_at ASC LIMIT ?",
+            (max(1, min(int(limit), 500)),)).fetchall()
+        return [_payout_view(r) for r in rows]
+
     def _submit(self, payout_id: str, bank_code: str, account_number: str,
                 narration: str) -> dict:
         p = self.conn.execute("SELECT * FROM payouts WHERE id = ?", (payout_id,)).fetchone()

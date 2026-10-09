@@ -1,0 +1,78 @@
+# aibank — systemd units for a host without Docker.
+#
+#   sudo useradd --system --home /var/lib/aibank --shell /usr/sbin/nologin aibank
+#   sudo mkdir -p /opt/aibank /var/lib/aibank /var/backups/aibank
+#   sudo cp -r aibank /opt/aibank/
+#   sudo chown -R aibank:aibank /var/lib/aibank /var/backups/aibank
+#   sudo install -m 600 -o aibank -g aibank .env /etc/aibank.env
+#   sudo cp deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
+#   sudo -u aibank AIBANK_DB=/var/lib/aibank/aibank.db \
+#        python3 -m aibank.cli --db /var/lib/aibank/aibank.db migrate
+#   sudo systemctl enable --now aibank aibank-sweep.timer aibank-backup.timer
+#
+# Migration is NOT in any unit on purpose: a service that migrates on start
+# would apply an unreviewed ALTER to a live ledger during a routine restart.
+
+# ===========================================================================
+# aibank.service
+# ===========================================================================
+[Unit]
+Description=aibank — agent spending controls and double-entry ledger
+Documentation=https://github.com/Knox-mgk/aibank
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=aibank
+Group=aibank
+WorkingDirectory=/opt/aibank
+EnvironmentFile=/etc/aibank.env
+Environment=AIBANK_DB=/var/lib/aibank/aibank.db
+Environment=AIBANK_HOST=127.0.0.1
+Environment=AIBANK_PORT=8000
+Environment=PYTHONUNBUFFERED=1
+
+# Binds loopback only. Reaching it from outside the host is the reverse
+# proxy's job, because this is plain HTTP and the dashboard carries a session
+# token. If you change AIBANK_HOST, you are choosing to put that token on the
+# wire in clear.
+ExecStart=/usr/bin/python3 -m aibank.cli serve
+
+Restart=on-failure
+RestartSec=2s
+
+# --- hardening -------------------------------------------------------------
+# A payment service is a high-value target and this one needs almost nothing
+# from the host: no new privileges, no device access, no home directories, and
+# exactly one writable path.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# AF_INET/AF_INET6 for the listener and the outbound provider call; AF_UNIX
+# for the resolver. Nothing else.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/lib/aibank
+UMask=0077
+
+# Secrets must not land in a core dump that any admin can read.
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

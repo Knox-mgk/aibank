@@ -339,10 +339,20 @@ UPDATE payouts SET
 WHERE payee_id IS NOT NULL;
 """
 
+MIGRATION_4 = """
+-- The per-source-address login throttle does a COUNT over (client_ip,
+-- created_at). Without this index that is a full scan of login_attempts, and
+-- the table grows fastest exactly when it is being scanned most -- under a
+-- flood. An unindexed defence against a flood becomes part of the flood.
+CREATE INDEX IF NOT EXISTS idx_login_attempts_ip
+    ON login_attempts(client_ip, created_at);
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, MIGRATION_1),
     (2, MIGRATION_2),
     (3, MIGRATION_3),
+    (4, MIGRATION_4),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -466,6 +476,54 @@ def connect(path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = FULL")
     return conn
+
+
+def backup(path: str | Path, dest: str | Path) -> dict:
+    """Consistent online copy of the ledger, safe to run while serving.
+
+    WHY NOT `cp aibank.db backup.db`: in WAL mode the committed truth is split
+    across the database file and the `-wal` sidecar. Copying only the main file
+    captures a torn, older state; copying both with a plain `cp` races the
+    writer and can capture a half-written WAL frame. Either way the operator
+    finds out at restore time, which is the worst possible moment to discover a
+    backup was never valid.
+
+    `sqlite3`'s backup API steps through pages under the source's own lock, so
+    the destination is a transactionally consistent snapshot even under
+    concurrent writes, and it needs no downtime.
+
+    The copy is then OPENED and checked -- `PRAGMA integrity_check`, schema
+    version, and the trial balance -- because a backup that has never been read
+    back is a hope, not a backup. A ledger whose postings do not net to zero is
+    reported as corrupt here rather than at restore.
+    """
+    src = connect(path)
+    try:
+        dst = sqlite3.connect(str(dest), isolation_level=None)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+    check = connect(dest)
+    try:
+        integrity = check.execute("PRAGMA integrity_check").fetchone()[0]
+        version = current_version(check)
+        from . import ledger as _L
+        net = _L.trial_balance(check)
+        size = os.path.getsize(str(dest))
+    finally:
+        check.close()
+    return {
+        "path": str(dest),
+        "bytes": size,
+        "integrity": integrity,
+        "schema_version": version,
+        "trial_balance": net,
+        "ok": integrity == "ok" and net == 0 and version == SCHEMA_VERSION,
+    }
 
 
 class Database:

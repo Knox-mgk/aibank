@@ -6,13 +6,18 @@ wallet, allocates money to their agents, and sets each agent's ceilings from a
 dashboard. The agent gets an API key that can do exactly one thing with money:
 request a payout that the server either allows, holds for approval, or denies.
 
+**You self-host it against your own payment credentials.** aibank never holds
+your money and never touches a balance you do not own, so there is no custody
+and no payment licence in the picture — the deployment is yours. One command
+gets you a running service with TLS, a sweeper, and verified backups.
+
 **Zero third-party dependencies.** Python standard library only, by design.
 
 It ships both ends of that: a **dashboard** for the human and an **MCP server**
 so the agent spends through typed tools instead of hand-rolled HTTP.
 
 ```
-117 unit tests + 338 live assertions against real servers, 0 failures
+128 unit tests + 338 live assertions against real servers, 0 failures
 ```
 
 ---
@@ -193,18 +198,84 @@ Each of these was reproduced by a test before being fixed, and the test remains:
 - **Three tests hard-coded `schema_version == 2`.** Adding v3 failed them for
   no reason; they now assert against `db.SCHEMA_VERSION`. A test that must be
   edited by every migration is a test that will eventually be edited wrongly.
+- **Per-account lockout did nothing against spraying.** The durable throttle
+  counted failures per email, so one common password tried once each against a
+  thousand accounts never tripped anything — while every attempt still cost us
+  a full scrypt run. The attack was cheap for the attacker and expensive for
+  us, which is backwards. There is now a per-source-address counter, checked
+  *before* any key derivation so a flood costs the attacker an indexed `COUNT`
+  instead of our CPU, with a higher threshold than the per-account one because
+  a NAT'd office shares an address.
+- **Backup created a file where a directory was meant.** `backup /var/backups/aibank`
+  tested only `isdir`, so on a first run — when that directory does not exist
+  yet — it silently wrote a *file* with that name, and the next run refused
+  because "it exists". Both shipped timers pass exactly that path. Found by
+  running the command, not by reading it.
+- **Two backups in the same second collided.** The filename stamp is
+  second-granularity, so a retry inside one second failed on "exists" — a
+  false alarm from a timer that had actually succeeded. A name the tool chose
+  itself now never needs `--force`.
+- **A missing request field answered with a Python exception.** Omitting one
+  returned `{"error": "KeyError", "reason": "'user_id'"}` — a class name and a
+  quoted dict key, which tells an integrator nothing. Under a self-hosted
+  shape the HTTP surface *is* the documentation, so a 400 now names the field.
 
 ---
 
 ## Run it
 
+**Self-hosted, and that is the whole shape.** You run aibank against *your
+own* Flutterwave credentials. It never holds your money, there is no custody
+and no payment licence involved, and the operator of the deployment is you.
+
+One command, from clone to a running service with a verified backup:
+
 ```bash
 git clone https://github.com/Knox-mgk/aibank
 cd aibank
+./deploy/quickstart.sh
+```
 
+It generates fresh secrets into `.env` (mode 600 — there are no working
+defaults, by design), applies the schema explicitly, runs the full test suite
+*before* telling you it works, creates your account holder, and takes a first
+verified backup. Python 3.11+ is the only prerequisite; there is nothing to
+install.
+
+### Docker
+
+```bash
+cp .env.example .env && $EDITOR .env
+docker compose run --rm aibank migrate
+docker compose run --rm aibank create-user you@example.com
+docker compose up -d
+```
+
+`compose.yaml` brings up four things, not one: the service, an nginx that
+terminates TLS, a sweeper loop, and a backup loop that keeps 28 verified
+snapshots. The service **publishes no port** — it is reachable only through the
+proxy, because it speaks plain HTTP and the dashboard carries a session token.
+Put your certificate pair in `deploy/certs/` as `fullchain.pem` and
+`privkey.pem` (that directory is gitignored).
+
+### systemd, without Docker
+
+`deploy/systemd/` has the unit, a sweep timer (5 min) and a backup timer (6 h),
+with the install steps in a comment at the top of the unit. The service runs as
+a dedicated non-login user under `ProtectSystem=strict` with exactly one
+writable path, a `@system-service` syscall filter, and `LimitCORE=0` so secrets
+cannot land in a core dump.
+
+Migration is deliberately **not** in any unit or entrypoint. A service that
+migrates on start would apply an unreviewed `ALTER` to a live ledger during a
+routine restart or a replica scale-up.
+
+### Testing it yourself
+
+```bash
 export AIBANK_ALLOW_DEV_SECRETS=1 AIBANK_SCRYPT_N=1024
 
-# 117 unit tests (fake provider — no network, no credentials)
+# 128 unit tests (fake provider — no network, no credentials)
 python -m unittest discover -s tests
 
 # 338 assertions against REAL servers on real sockets
@@ -214,24 +285,43 @@ python scripts/smoke_dashboard.py   # 138  the dashboard's endpoints + markup
 python scripts/smoke_dom.py         #  44  the dashboard's own JS, under node
 ```
 
-No install step, no requirements file — there are no dependencies. `smoke_dom`
-skips itself cleanly when node is absent; the others are the mandatory gate.
+No install step, no requirements file — there are no dependencies.
+`smoke_dom` skips itself cleanly when node is absent; the others are the
+mandatory gate.
 
 ### Operating it
 
 ```bash
-export AIBANK_ADMIN_KEY=$(python -c 'import secrets;print(secrets.token_urlsafe(32))')
-export AIBANK_KEY_PEPPER=$(python -c 'import secrets;print(secrets.token_urlsafe(32))')
-export FLW_SECRET_KEY=...        # real provider credential
-export FLW_SECRET_HASH=...       # webhook signing secret
-export AIBANK_DB=/var/lib/aibank/aibank.db
-
 python -m aibank.cli migrate                      # explicit, auditable upgrade
 python -m aibank.cli create-user you@example.com  # prompts for the password
 python -m aibank.cli serve --port 8000
 python -m aibank.cli sweep-holds                  # run on a timer
+python -m aibank.cli needs-reconciliation         # the sweeper's open tickets
+python -m aibank.cli reconcile PAYOUT_ID          # ask the provider the truth
+python -m aibank.cli backup --dir ./backups       # verified snapshot
 python -m aibank.cli trial-balance                # 0 = books balance
 ```
+
+Two of those are not optional in a real deployment, which is why both compose
+and the systemd units ship them on timers:
+
+- **`sweep-holds`** — holds carry an expiry so a webhook that never arrives
+  cannot freeze an agent's money forever. Nothing enforces that unless
+  something runs the sweeper.
+- **`needs-reconciliation`** — the sweeper deliberately refuses to declare an
+  unanswered payout failed, because the money may well have left. That
+  correctness choice creates an operator obligation, and this is the queue.
+  It **exits 2** when there is work, so a cron or systemd wrapper alerts
+  without parsing stdout.
+
+**Backups use SQLite's online backup API, not `cp`.** In WAL mode the committed
+truth is split between the database file and its `-wal` sidecar, so copying the
+file captures a torn state and copying both races the writer. `backup` snapshots
+under the source's own lock while the service is live, then **opens the copy**
+and checks `integrity_check`, the schema version and the trial balance — a
+backup nobody has read back is a hope, not a backup. Keep
+`AIBANK_KEY_PEPPER` with it: a restored ledger without its pepper has no
+working agent keys.
 
 The service **refuses to boot** without `AIBANK_ADMIN_KEY` and
 `AIBANK_KEY_PEPPER`. For local work only, `AIBANK_ALLOW_DEV_SECRETS=1` restores
@@ -244,6 +334,24 @@ database is exactly when an unreviewed, unbacked-up `ALTER` is most dangerous.
 `migrate` is the deliberate step, and every migration runs in one transaction
 with a `PRAGMA foreign_key_check` afterwards. A test asserts this, because the
 guarantee was documented here for a while before the code actually kept it.
+
+### Running behind a reverse proxy
+
+Set `AIBANK_TRUSTED_PROXY=1` **only** when the service is unreachable except
+through a proxy that *overwrites* `X-Forwarded-For` (`deploy/nginx.conf` does).
+Wrong in either direction hurts, and the two failures are opposites:
+
+- Left off behind a proxy, every request appears to come from the proxy, so the
+  per-address login throttle puts the whole internet in one bucket — the first
+  sprayer locks out every legitimate user, and the defence becomes the outage.
+- Switched on while the port is directly reachable, a client forges the header
+  to mint unlimited fresh throttle buckets and to write any address it likes
+  into the audit log.
+
+`deploy/nginx.conf` also rate-limits `/v1/auth/login` and `/v1/auth/register` at
+the edge (10/min, burst 5). That is the cheap outer layer; aibank's own
+per-address throttle still applies underneath it, because an edge limit vanishes
+the moment someone runs the container without the proxy.
 
 ## The MCP server — `pay()` as a typed tool
 
@@ -355,9 +463,13 @@ GET    /health                            GET    /  ·  /dashboard  (the UI)
 | `aibank/cli.py` | migrate / serve / sweep / create-user |
 | `aibank/mcp_server.py` | MCP stdio server — `pay()` as a typed LLM tool |
 | `aibank/static/dashboard.html` | the whole dashboard: one file, no build step |
+| `Dockerfile`, `compose.yaml` | the self-hosted stack: service, TLS, sweeper, backups |
+| `deploy/quickstart.sh` | clone to running service in one command |
+| `deploy/nginx.conf` | TLS termination, edge rate limit, unspoofable `X-Forwarded-For` |
+| `deploy/systemd/` | unit plus sweep and backup timers, hardened |
 | `scripts/smoke_*.py` | 338 assertions against live servers |
 | `scripts/dom_check.mjs` | runs the page's real JS against a minimal DOM |
-| `tests/` | 117 tests, including the concurrency suite |
+| `tests/` | 128 tests, including the concurrency suite |
 
 ## Known limits
 
@@ -367,6 +479,8 @@ Stated plainly rather than discovered later:
   correctness assumes exactly one process owns the database file. Two workers
   against one SQLite file would reintroduce the policy-check/hold race. Multi-
   worker deployment needs Postgres behind `Database`, not a second process.
+  `compose.yaml` pins `replicas: 1` for this reason — it is a correctness
+  boundary, not a tuning choice.
 - **Timezones are fixed offsets**, not tzdata zones, because the service must
   run on hosts with no tzdata (Termux/Android has none, and
   `ZoneInfo('Africa/Lagos')` raises there). Correct for zones without DST,
@@ -381,7 +495,23 @@ Stated plainly rather than discovered later:
   Safari. Treat the first real browser session as a test still owed.
 - **The dashboard is served over plain HTTP by `http.server`.** Put it behind a
   TLS-terminating reverse proxy before it leaves localhost; a session token on
-  the wire in clear is the whole account.
+  the wire in clear is the whole account. `compose.yaml` and
+  `deploy/nginx.conf` do this, and the compose service publishes no port of its
+  own so it cannot be reached around the proxy.
+- **The real Flutterwave API has never been called.** Every provider reference
+  in the tests and smoke scripts uses a fake. Field names, error shapes, status
+  strings and webhook payloads are taken from the documentation, not from a
+  live call — so the adapter is the least-proven layer in the codebase, and it
+  is the one that moves money. Get sandbox credentials and run one real
+  transfer and one real webhook before trusting it.
+- **No 2FA on the human session**, which is the session that sets the limits.
+  Password plus durable per-account and per-address lockout is the whole story
+  today.
+- **No email verification and no password reset.** An operator can create and
+  reset accounts with the CLI; account holders cannot recover their own.
+- **No metrics or structured logging.** `/health` reports the schema version,
+  and `needs-reconciliation` exits 2 when a human is needed, which is enough to
+  alert on but is not observability.
 - Not load-tested.
 
 ## Licence

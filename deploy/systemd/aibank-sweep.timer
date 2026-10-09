@@ -1,0 +1,14 @@
+[Unit]
+Description=aibank — sweep expired holds every 5 minutes
+
+[Timer]
+# Five minutes is a tradeoff, not a default: it bounds how long an agent's
+# money can sit frozen after a lost webhook. Shorter costs nothing here (the
+# sweeper is a single indexed query when there is nothing to do).
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=aibank-sweep.service
+
+[Install]
+WantedBy=timers.target

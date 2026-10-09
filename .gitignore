@@ -13,3 +13,11 @@ deny.json
 deny2.json
 _probe*.py
 .env
+backups/
+quickstart-tests.log
+
+# TLS material for a self-hosted deployment. A private key committed to a
+# public repo is compromised the moment it is pushed.
+deploy/certs/
+*.pem
+*.key

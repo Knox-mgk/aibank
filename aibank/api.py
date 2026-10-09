@@ -52,6 +52,11 @@ CSP = ("default-src 'none'; "
 
 _ADMIN_KEY: str | None = None
 
+# Read once at import, because this is a deployment-shape assertion rather
+# than a per-request decision: either the service is reachable only through a
+# proxy or it is not. See Handler._client_ip for why it must be opt-in.
+_TRUST_PROXY = os.environ.get("AIBANK_TRUSTED_PROXY", "").strip() in ("1", "true", "yes")
+
 
 def admin_key() -> str:
     """Fail closed, like FLW_SECRET_HASH already did.
@@ -139,7 +144,33 @@ def make_handler(bank: Bank):
             return auth[7:].strip() if auth.lower().startswith("bearer ") else ""
 
         def _client_ip(self) -> str:
-            return self.client_address[0] if self.client_address else "?"
+            """The address the throttles are keyed on.
+
+            Behind a reverse proxy every connection arrives from the proxy, so
+            `client_address` is the SAME value for every user on the internet.
+            Keying the per-address login throttle on that would put the whole
+            world in one bucket: the first sprayer to trip it would lock out
+            every legitimate user, turning our own defence into the outage.
+
+            `X-Forwarded-For` fixes that, and is a header the CLIENT can set,
+            so trusting it unconditionally is worse than ignoring it -- an
+            attacker would just rotate the header and get an unlimited number
+            of fresh buckets, defeating the throttle entirely while also being
+            able to frame any address they like in the audit log.
+
+            So it is opt-in: only when the operator asserts
+            `AIBANK_TRUSTED_PROXY=1` -- meaning the service is genuinely
+            unreachable except through a proxy that OVERWRITES the header (see
+            deploy/nginx.conf) -- and even then only the leftmost entry is
+            taken, since anything a proxy appends sits to the right of what the
+            client sent.
+            """
+            direct = self.client_address[0] if self.client_address else "?"
+            if not _TRUST_PROXY:
+                return direct
+            fwd = self.headers.get("X-Forwarded-For") or ""
+            first = fwd.split(",")[0].strip()
+            return first or direct
 
         def _agent(self) -> str:
             """Authenticate an AGENT. Rejects session tokens by construction."""
@@ -493,8 +524,19 @@ def make_handler(bank: Bank):
                 self._send(402, {"error": "insufficient_funds", "reason": str(exc)})
             except DuplicateIdempotencyKey as exc:
                 self._send(409, {"error": "duplicate", "entry_id": exc.existing_entry_id})
-            except (MoneyError, LedgerError, BankError, KeyError, ValueError) as exc:
+            except (MoneyError, LedgerError, BankError, ValueError) as exc:
                 self._send(400, {"error": type(exc).__name__, "reason": str(exc)})
+            except KeyError as exc:
+                # A missing required field used to surface as
+                # {"error": "KeyError", "reason": "'user_id'"} -- a Python
+                # exception class name and a quoted dict key, which tells an
+                # integrator nothing about what to send. Under a self-hosted
+                # shape the HTTP surface IS the product's documentation, so a
+                # 400 has to name the field in words.
+                field = exc.args[0] if exc.args else "?"
+                self._send(400, {"error": "missing_field",
+                                 "reason": f"required field missing: {field}",
+                                 "field": field})
             except Exception as exc:  # noqa: BLE001
                 # Log the detail, return none of it: a stack-trace string in a
                 # response body is a free schema disclosure.

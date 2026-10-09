@@ -1,0 +1,24 @@
+# Keep the image to the package itself.
+#
+# Tests and smoke scripts are deliberately excluded: they are the gate you run
+# before building, not cargo to ship into a production image. Shipping them
+# would also put `AIBANK_ALLOW_DEV_SECRETS` usage examples inside the
+# container, which is exactly the wrong thing to have lying around.
+.git
+.gitignore
+.env
+.env.example
+tests/
+scripts/
+deploy/
+compose.yaml
+Dockerfile
+README.md
+LICENSE
+e2e.sh
+run_demo_server.py
+**/__pycache__/
+**/*.py[cod]
+*.db
+*.db-shm
+*.db-wal

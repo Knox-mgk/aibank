@@ -1,0 +1,31 @@
+[Unit]
+Description=aibank — release expired holds and report reconciliation work
+Documentation=https://github.com/Knox-mgk/aibank
+After=aibank.service
+
+[Service]
+Type=oneshot
+User=aibank
+Group=aibank
+WorkingDirectory=/opt/aibank
+EnvironmentFile=/etc/aibank.env
+Environment=AIBANK_DB=/var/lib/aibank/aibank.db
+
+# Holds carry an expiry so a webhook that never arrives cannot freeze an
+# agent's money forever. That guarantee is only real if something runs this.
+ExecStart=/usr/bin/python3 -m aibank.cli sweep-holds
+
+# needs-reconciliation exits 2 when a payout was released without a known
+# outcome, so journald records a failed unit and any alerting you already have
+# on systemd picks it up without parsing stdout. SuccessExitStatus keeps that
+# from looking like a crash loop.
+ExecStart=/usr/bin/python3 -m aibank.cli needs-reconciliation
+SuccessExitStatus=0 2
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/aibank
+UMask=0077
+LimitCORE=0

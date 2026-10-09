@@ -6,6 +6,9 @@
     python -m aibank.cli sweep-holds        # release holds with no callback
     python -m aibank.cli create-user EMAIL  # register an account holder
     python -m aibank.cli trial-balance      # prove the books net to zero
+    python -m aibank.cli backup DEST        # verified online ledger copy
+    python -m aibank.cli needs-reconciliation   # the sweeper's open tickets
+    python -m aibank.cli reconcile PAYOUT_ID    # ask the provider the truth
 
 `migrate` exists because `Database(migrate_on_open=False)` refuses to open a
 database whose schema does not match the code -- which is the right behaviour
@@ -18,6 +21,7 @@ import argparse
 import getpass
 import os
 import sys
+from datetime import datetime, timezone
 
 from . import db as D
 from . import ledger as L
@@ -120,6 +124,87 @@ def cmd_sweep(args) -> int:
         bank.close()
 
 
+def cmd_backup(args) -> int:
+    path = _db_path(args)
+    conn = D.connect(path)
+    try:
+        _require_head(conn, path)
+    finally:
+        conn.close()
+    dest = args.dest
+    # A trailing separator, or an existing directory, means "put a timestamped
+    # file in here". Testing only `isdir` was wrong: on a first run the backup
+    # directory does not exist yet, so `backup /var/backups/aibank` silently
+    # created a FILE with that name -- and the next run then refused because
+    # "it exists". Both the compose and systemd units pass a directory that
+    # will not exist the first time, which is exactly the path that broke.
+    want_dir = (os.path.isdir(dest)
+                or dest.endswith(("/", os.sep))
+                or args.dir)
+    if want_dir:
+        os.makedirs(dest, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest = os.path.join(dest, f"aibank-{stamp}.db")
+        # The stamp is second-granularity, so a retry inside the same second
+        # would collide and exit non-zero -- a false alarm from a backup timer
+        # that actually succeeded. A name WE chose should never need --force;
+        # that flag is for protecting a path the operator named.
+        if os.path.exists(dest):
+            base = dest[:-3]
+            n = 2
+            while os.path.exists(f"{base}-{n}.db"):
+                n += 1
+            dest = f"{base}-{n}.db"
+    else:
+        parent = os.path.dirname(os.path.abspath(dest))
+        os.makedirs(parent, exist_ok=True)
+    if os.path.exists(dest) and not args.force:
+        print(f"error: {dest} exists; pass --force to overwrite", file=sys.stderr)
+        return 1
+    res = D.backup(path, dest)
+    print(f"{res['path']}  {res['bytes']} bytes  schema v{res['schema_version']}")
+    print(f"integrity: {res['integrity']}   trial balance: {res['trial_balance']}")
+    if not res["ok"]:
+        print("BACKUP NOT USABLE -- do not rely on this file", file=sys.stderr)
+        return 1
+    print("verified: this copy was opened and checked, not just written")
+    return 0
+
+
+def cmd_needs_reconciliation(args) -> int:
+    from .bank import Bank
+    bank = Bank(_db_path(args))
+    try:
+        rows = bank.needs_reconciliation()
+        if not rows:
+            print("nothing awaiting reconciliation")
+            return 0
+        print(f"{len(rows)} payout(s) awaiting reconciliation:\n")
+        for p in rows:
+            print(f"  {p['id']}  {p.get('currency','')} {p.get('amount','?')}"
+                  f"  agent={p.get('agent_id','?')}  status={p.get('status','?')}")
+            print(f"      created {p.get('created_at','?')}  ref={p.get('reference','?')}")
+            print(f"      resolve: python -m aibank.cli reconcile {p['id']}")
+        # Non-zero: this is a nagios-style check as much as a report, so a
+        # cron wrapper can alert on it without parsing stdout.
+        return 2
+    finally:
+        bank.close()
+
+
+def cmd_reconcile(args) -> int:
+    from .bank import Bank
+    bank = Bank(_db_path(args))
+    try:
+        res = bank.reconcile(args.payout_id)
+        print(f"provider says: {res.get('status')}")
+        p = res.get("payout") or {}
+        print(f"payout now: {p.get('status','?')}")
+        return 0
+    finally:
+        bank.close()
+
+
 def cmd_serve(args) -> int:
     from .api import serve
     path = _db_path(args)
@@ -160,6 +245,21 @@ def main(argv=None) -> int:
     sv.add_argument("--host", default=os.environ.get("AIBANK_HOST", "127.0.0.1"))
     sv.add_argument("--port", type=int, default=int(os.environ.get("AIBANK_PORT", "8000")))
     sv.set_defaults(fn=cmd_serve)
+
+    bk = sub.add_parser("backup", help="verified online copy of the ledger")
+    bk.add_argument("dest", help="destination file, or a directory to timestamp into")
+    bk.add_argument("--force", action="store_true", help="overwrite an existing file")
+    bk.add_argument("--dir", action="store_true",
+                    help="treat DEST as a directory and create it if missing")
+    bk.set_defaults(fn=cmd_backup)
+
+    nr = sub.add_parser("needs-reconciliation",
+                        help="payouts the sweeper could not resolve (exit 2 if any)")
+    nr.set_defaults(fn=cmd_needs_reconciliation)
+
+    rc = sub.add_parser("reconcile", help="ask the provider the truth about one payout")
+    rc.add_argument("payout_id")
+    rc.set_defaults(fn=cmd_reconcile)
 
     args = p.parse_args(argv)
     return args.fn(args)
