@@ -202,6 +202,61 @@ globalThis.fetch = async (path, opts) => {
   }
 };
 
+/* ------------------------------------------- expectations from the server */
+// The assertions below used to hard-code this harness's own fixture values
+// ("Dom", "dash-agent", exactly one pending approval). That made the harness
+// unrunnable against any other seeded database: pointed at a demo server it
+// reported three FAILs for a page that was rendering correctly, which is the
+// worst failure mode a test can have. Ask the API what the truth is, then
+// assert the page renders THAT. The expectation still comes from outside the
+// page, so the assertion keeps its meaning.
+const preflight = async () => {
+  const login = await realFetch(BASE + "/v1/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
+  });
+  if (!login.ok) {
+    throw new Error(`preflight login failed: ${login.status} ` +
+                    `${await login.text()}`);
+  }
+  const body = await login.json();
+  const token = body.token || body.session_token;
+  if (!token) throw new Error(`preflight login returned no token`);
+  const dash = await realFetch(BASE + "/v1/dashboard",
+                               { headers: { Authorization: "Bearer " + token } });
+  if (!dash.ok) {
+    throw new Error(`preflight dashboard failed: ${dash.status}`);
+  }
+  const d = await dash.json();
+  const u = d.user || {};
+  const agents = d.agents || [];
+  if (!agents.length) {
+    throw new Error("preflight: server has no agents; the agent-card " +
+                    "assertions cannot be meaningful. Seed one first.");
+  }
+  const approvals = d.pending_approvals || [];
+  if (!approvals.length) {
+    throw new Error("preflight: server has no pending approvals; the " +
+                    "approval-flow assertions cannot be meaningful.");
+  }
+  // Release the preflight session so it does not sit in the sessions table.
+  await realFetch(BASE + "/v1/auth/logout",
+                  { method: "POST",
+                    headers: { Authorization: "Bearer " + token } });
+  return {
+    whoami: (u.display_name || u.email || "") +
+            (u.role === "admin" ? " \u00b7 admin" : ""),
+    agentName: agents[0].name,
+    agentStatus: agents[0].status,
+    approvalCount: approvals.length,
+  };
+};
+const EXPECT = await preflight();
+console.log(`  expectations from the API: whoami=${JSON.stringify(EXPECT.whoami)} ` +
+            `agent[0]=${JSON.stringify(EXPECT.agentName)} ` +
+            `(${EXPECT.agentStatus}) pending=${EXPECT.approvalCount}\n`);
+
 /* --------------------------------------------------- run the page's code */
 const script = [...HTML.matchAll(/<script>([\s\S]*?)<\/script>/g)]
   .map((m) => m[1]).join("\n");
@@ -265,9 +320,11 @@ check("dashboard view is visible",
       byId.get("dashview").classList.contains("hidden"), false);
 check("auth view hidden", byId.get("authview").classList.contains("hidden"), true);
 check("password field cleared after sign-in", byId.get("password").value, "");
-// The header shows the DISPLAY NAME ("Dom"), not the email local part
-// ("dom") -- matching case-sensitively on the email was the harness's bug.
-check("identity in the header", byId.get("whoami").textContent, "Dom");
+// The header shows the DISPLAY NAME, not the email local part -- matching
+// case-sensitively on the email was the harness's original bug. The expected
+// string now comes from /v1/dashboard (see preflight), so this runs against
+// any seeded database instead of only the CI fixture.
+check("identity in the header", byId.get("whoami").textContent, EXPECT.whoami);
 // A page error is caught by the page and rendered into #flash. Assert it is
 // clean, or every later "rendered nothing" failure hides the real reason.
 check("no error flash after sign-in", byId.get("flash")?.textContent || "", "");
@@ -286,8 +343,8 @@ check("pending count rendered",
 const agents = byId.get("agents");
 check("an agent card rendered", agents.children.length >= 1, true);
 const card = agents.children[0];
-check("agent name shown", card.textContent.includes("dash-agent"), true);
-check("agent marked active", card.textContent.includes("active"), true);
+check("agent name shown", card.textContent.includes(EXPECT.agentName), true);
+check("agent marked active", card.textContent.includes(EXPECT.agentStatus), true);
 check("available balance shown on the card",
       card.textContent.includes("available"), true);
 
@@ -326,8 +383,18 @@ await settle();
 const approveCall = FETCHES.slice(before).find((f) => /\/approve$/.test(f.path));
 check("confirming approves via POST", !!approveCall, true);
 check("approve used POST", approveCall?.method, "POST");
-check("approvals card hidden once empty",
-      byId.get("approvalsCard").classList.contains("hidden"), true);
+// After approving one, the card hides only if that was the LAST pending
+// approval. Hard-coding "hidden" assumed a one-approval fixture and failed
+// against any realistic database; assert the actual rule instead.
+if (EXPECT.approvalCount === 1) {
+  check("approvals card hidden once empty",
+        byId.get("approvalsCard").classList.contains("hidden"), true);
+} else {
+  check("approvals card still shown while others pend",
+        byId.get("approvalsCard").classList.contains("hidden"), false);
+  check("one fewer approval rendered after approving",
+        byId.get("approvals").children.length, EXPECT.approvalCount - 1);
+}
 
 /* ------------------------------------------------------- payments table */
 const payouts = byId.get("payouts");
