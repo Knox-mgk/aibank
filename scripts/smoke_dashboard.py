@@ -432,6 +432,21 @@ for key, tails in DYNAMIC_TAILS.items():
         for t in tails:
             called.add((key[0], key[1] + t))
 
+# The second-factor call sites are covered by scripts/smoke_mfa.py, which has
+# to drive them in sequence (enrol -> confirm -> login -> verify) against a
+# live TOTP secret. Re-deriving codes here would duplicate that script, so the
+# delegation is DECLARED rather than silent: if a route is removed from this
+# list it becomes uncovered again and this check fails, which is the behaviour
+# that matters. Keep the two in sync.
+DELEGATED_TO_SMOKE_MFA = {
+    ("GET", "/v1/auth/mfa"),
+    ("POST", "/v1/auth/mfa/enrol"),
+    ("POST", "/v1/auth/mfa/confirm"),
+    ("POST", "/v1/auth/mfa/verify"),
+    ("POST", "/v1/auth/mfa/disable"),
+    ("POST", "/v1/auth/mfa/recovery-codes"),
+}
+
 
 def norm(method: str, path: str) -> tuple[str, str]:
     p = path.split("?")[0]
@@ -442,8 +457,14 @@ def norm(method: str, path: str) -> tuple[str, str]:
 
 exercised_norm = {norm(m, p) for m, p in EXERCISED}
 missing = [f"{m} {p}" for m, p in sorted(called)
-           if (m, p.split("?")[0].rstrip("/") or "/") not in exercised_norm]
+           if (m, p.split("?")[0].rstrip("/") or "/") not in exercised_norm
+           and (m, p.split("?")[0].rstrip("/")) not in DELEGATED_TO_SMOKE_MFA]
 check("no dashboard call site is untested", missing, [])
+# Guard the delegation itself: if a declared route disappears from the page,
+# this list is stale and must be pruned rather than quietly covering nothing.
+stale = sorted(f"{m} {p}" for m, p in DELEGATED_TO_SMOKE_MFA
+               if (m, p) not in called)
+check("no stale smoke_mfa delegation", stale, [])
 check("the coverage extractor found the page's call sites",
       len(called) >= 15, True)
 print(f"       ({len(called)} call sites in the page, "

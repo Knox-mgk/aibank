@@ -97,6 +97,14 @@ def main() -> int:
     print(f"  database: {args.db}")
     print(f"  sign in:  {seedmod.DEMO_EMAIL}  /  {seedmod.DEMO_PASSWORD}")
     print(f"  dashboard: http://{args.host}:{args.port}/\n")
+    # Deliberately NOT pre-enrolled: a seeded TOTP secret would mean nobody can
+    # sign in to the demo without first loading it into an authenticator app,
+    # which turns a one-command evaluation into a setup chore. Point at the
+    # card instead, so the flow is available but not mandatory.
+    print("  Two-step verification is OFF for the demo account. To try it,")
+    print("  use the Security card on the dashboard — you will need an")
+    print("  authenticator app (the secret is shown for manual entry), and it")
+    print("  hands you ten recovery codes so you cannot lock yourself out.\n")
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         print("  WARNING: non-loopback bind over plain HTTP — the password and")
         print("  session token are readable on the wire. Trusted network only.\n")

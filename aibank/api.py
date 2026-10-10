@@ -30,6 +30,7 @@ from .bank import Bank, BankError, NotFound, PolicyDenied, _require_secret
 from .flutterwave import verify_webhook
 from .ledger import LedgerError, InsufficientFunds, DuplicateIdempotencyKey
 from .money import MoneyError
+from .totp import TotpError
 
 SECRET_HASH = os.environ.get("FLW_SECRET_HASH", "")
 
@@ -51,6 +52,20 @@ CSP = ("default-src 'none'; "
        "frame-ancestors 'none'")
 
 _ADMIN_KEY: str | None = None
+
+
+class SessionInvalid(PermissionError):
+    """The SESSION token is missing, expired or revoked.
+
+    Distinct from every other 401 because the client must react differently. A
+    dashboard treats 401 as "my session died, sign out" -- correct when the
+    token is dead, catastrophic when the real meaning was "the password or
+    one-time code you just typed was wrong": a single typo in the 2FA field
+    would eject the user to the sign-in screen mid-enrolment.
+
+    So the session-level failure gets a machine-readable code of its own and
+    everything else stays an ordinary auth failure the page can show inline.
+    """
 
 # Read once at import, because this is a deployment-shape assertion rather
 # than a per-request decision: either the service is reachable only through a
@@ -183,7 +198,7 @@ def make_handler(bank: Bank):
             """Authenticate a HUMAN via dashboard session."""
             sess = U.authenticate_session(bank, self._bearer())
             if not sess:
-                raise PermissionError("invalid or expired session")
+                raise SessionInvalid("invalid or expired session")
             return sess
 
         def _admin(self):
@@ -227,8 +242,20 @@ def make_handler(bank: Bank):
 
                 if path == "/v1/auth/login" and method == "POST":
                     b = self._json(raw)
-                    return self._send(200, U.login(
+                    out = U.login(
                         bank, b["email"], b["password"], client_ip=self._client_ip(),
+                        user_agent=self.headers.get("User-Agent"))
+                    # 200 with a challenge rather than 401: the credentials were
+                    # correct and the client has a next step to take. A 401 here
+                    # would make every client treat a successful password as a
+                    # failure.
+                    return self._send(200, out)
+
+                if path == "/v1/auth/mfa/verify" and method == "POST":
+                    b = self._json(raw)
+                    return self._send(200, U.complete_mfa(
+                        bank, b["challenge_token"], b["code"],
+                        client_ip=self._client_ip(),
                         user_agent=self.headers.get("User-Agent")))
 
                 if path == "/v1/auth/logout" and method == "POST":
@@ -241,6 +268,45 @@ def make_handler(bank: Bank):
                     U.change_password(bank, s["user_id"], b["current_password"],
                                       b["new_password"])
                     return self._send(200, {"ok": True, "sessions_revoked": True})
+
+                # ------------- second factor (user session + password) -------------
+                # Every route here is user-session only, exactly like the policy
+                # route: an agent key must not be able to read, enrol, or remove
+                # the factor that guards the limits it spends under.
+                if path == "/v1/auth/mfa/enrol" and method == "POST":
+                    s = self._user()
+                    b = self._json(raw)
+                    return self._send(200, U.begin_totp_enrolment(
+                        bank, s["user_id"], b["current_password"]))
+
+                if path == "/v1/auth/mfa/confirm" and method == "POST":
+                    s = self._user()
+                    b = self._json(raw)
+                    return self._send(200, U.confirm_totp_enrolment(
+                        bank, s["user_id"], b["code"]))
+
+                if path == "/v1/auth/mfa" and method == "GET":
+                    s = self._user()
+                    return self._send(200, {
+                        "enabled": U.is_mfa_enrolled(bank, s["user_id"]),
+                        "recovery_codes_remaining": U.count_recovery_codes(
+                            bank, s["user_id"])})
+
+                if path == "/v1/auth/mfa/disable" and method == "POST":
+                    s = self._user()
+                    b = self._json(raw)
+                    U.disable_totp(bank, s["user_id"], b["current_password"],
+                                   b.get("code"))
+                    return self._send(200, {"enabled": False,
+                                            "sessions_revoked": True})
+
+                if path == "/v1/auth/mfa/recovery-codes" and method == "POST":
+                    s = self._user()
+                    b = self._json(raw)
+                    return self._send(200, {"recovery_codes":
+                                            U.regenerate_recovery_codes(
+                                                bank, s["user_id"],
+                                                b["current_password"])})
 
                 # ---------------- dashboard (user session) ----------------
                 if path == "/v1/me" and method == "GET":
@@ -510,12 +576,28 @@ def make_handler(bank: Bank):
 
                 return self._send(404, {"error": "not found", "path": path})
 
+            except SessionInvalid as exc:
+                # Checked BEFORE PermissionError, which it subclasses. The
+                # stable code is what lets the dashboard sign the user out on a
+                # dead session without doing so for a mistyped one-time code.
+                self._send(401, {"error": "session_invalid", "reason": str(exc)})
             except PermissionError as exc:
                 self._send(401, {"error": str(exc)})
             except U.LockedOut as exc:
                 self._send(429, {"error": "locked_out", "reason": str(exc)})
             except U.AuthError as exc:
                 self._send(401, {"error": "auth_failed", "reason": str(exc)})
+            except TotpError as exc:
+                # Reaching here means a SEALED SECRET would not open: the key
+                # pepper changed, or a row was edited outside the application.
+                # That is an operator fault, not a user one, so it must not be
+                # reported as "invalid code" -- that would send the user round
+                # a retry loop that can never succeed. Detail is logged, not
+                # returned.
+                print(f"[api] SEAL FAILURE: {exc}")
+                self._send(500, {"error": "mfa_unavailable",
+                                 "reason": "the second-factor secret could not be "
+                                           "read; check AIBANK_KEY_PEPPER"})
             except NotFound as exc:
                 self._send(404, {"error": "not_found", "reason": str(exc)})
             except PolicyDenied as exc:

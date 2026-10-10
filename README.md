@@ -150,6 +150,53 @@ Both compared in constant time (`hmac.compare_digest`).
   password — a stolen session token cannot be upgraded into account ownership.
 - API keys are per-agent, labelled, and revocable individually.
 
+### Two-step verification (TOTP)
+
+The human session is the one credential the central invariant rests on: whoever
+holds it sets every agent's ceiling. A phished password is therefore not an
+account problem but a *policy* problem, so the account holder can require a
+second factor.
+
+- **RFC 6238 TOTP**, implemented in `aibank/totp.py` from the spec — no
+  dependency, and pinned against the RFC's own published test vectors for both
+  TOTP and HOTP, so any authenticator app agrees with us.
+- **A password alone yields no session once enrolled.** `POST /v1/auth/login`
+  returns `{"mfa_required": true, "challenge_token": ...}` and the session is
+  minted only by `POST /v1/auth/mfa/verify`. Sessions are created in exactly
+  one function, reachable only after whatever the account requires — a second
+  factor that one forgetful code path can skip is not a second factor.
+- **Secrets are sealed at rest**, not stored in plaintext. A TOTP secret is
+  symmetric, so a plaintext column would make it the easiest credential to
+  steal from a database dump — easier than the scrypt-hashed password it is
+  meant to reinforce. Sealing is encrypt-then-MAC under `AIBANK_KEY_PEPPER`
+  (HMAC-SHA256 keystream, separate MAC key, random nonce), so a dump alone
+  yields nothing and write access alone cannot substitute an attacker's secret.
+  Stated plainly: a dump *plus* the environment does yield them — the same
+  trust boundary the API key pepper already defines.
+- **Codes are single-use.** The accepted counter is stored, so an observed code
+  cannot be replayed within its 30–90 second validity, and that survives a
+  restart.
+- **Guesses are capped per challenge** (5), with the attempt committed in its
+  own transaction — an increment inside a transaction that then raises is an
+  increment that never happened, which is precisely how this project's login
+  lockout was once silently dead.
+- **Enrolment is two-phase.** The secret is stored but inactive until one
+  working code is proven, so a mistyped key or a skewed clock cannot lock the
+  owner out of a funded wallet.
+- **Removing the factor requires the password *and* the factor.** If the
+  password alone could disable it, a password thief would switch it off instead
+  of defeating it. Disabling revokes every session, so an attacker doing it is
+  visible to the owner on their next page load.
+- **Ten single-use recovery codes**, peppered-hashed, shown once, rotatable.
+  Without them a lost phone means a frozen wallet with live agents still
+  spending under limits nobody can change — and users work around that by
+  screenshotting the QR, which is worse than the problem.
+- **A spent code is reported differently from a wrong one.** Confirming
+  enrolment spends the code on screen, so signing in seconds later presents a
+  correct-but-used code; calling that "invalid" tells a user whose setup works
+  that it is broken. It says "wait for the next code" and does not burn the
+  challenge.
+
 ## Concurrency
 
 SQLite in WAL mode with `BEGIN IMMEDIATE` write transactions and thread-local
@@ -189,6 +236,18 @@ Each of these was reproduced by a test before being fixed, and the test remains:
   error. Both now fail closed.
 - **Currency was never cross-checked** between payout and payee: a USD payout
   to an NGN account is a ~1,500x error, not a conversion.
+- **A working authenticator reported as broken.** Confirming 2FA enrolment
+  spends the code on screen, so signing in within that same 30-second step
+  presented a correct-but-already-used code. It was reported as "invalid code"
+  and charged an attempt against the brute-force cap — telling a user whose
+  setup was fine that it was broken, which is how people conclude 2FA is flaky
+  and turn it off. Spent and wrong are now distinct, and a spent code does not
+  burn the challenge.
+- **A mistyped one-time code signed the user out.** The dashboard treated every
+  401 as "my session died", which is right for a dead token and wrong for
+  "the code you just typed was incorrect" — one typo ejected the user to the
+  sign-in screen mid-enrolment. The server now returns a distinct
+  `session_invalid` code and the page only signs out on that.
 - **A payout to a raw destination could never be approved.** Payments to a
   saved payee were fine, but one sent straight to a bank code and account
   number recorded no destination, so the approval path had nothing to submit:
@@ -294,7 +353,12 @@ export AIBANK_KEY_PEPPER="$(python -c 'import secrets;print(secrets.token_urlsaf
 ```
 
 Keep the pepper with your backups. A restored ledger without its pepper has no
-working agent keys.
+working agent keys **and no working second factors** — the sealed TOTP secrets
+cannot be opened, so every enrolled account holder is left with recovery codes
+as their only way in. Rotating the pepper on a live deployment is not a
+supported operation for the same reason: it invalidates both at once. The
+service names this explicitly (`mfa_unavailable`, pointing at
+`AIBANK_KEY_PEPPER`) rather than telling users their codes are wrong.
 
 ### Or clone it — one command from git to a running service
 
@@ -343,14 +407,15 @@ routine restart or a replica scale-up.
 ```bash
 export AIBANK_ALLOW_DEV_SECRETS=1 AIBANK_SCRYPT_N=1024
 
-# 148 unit tests (fake provider — no network, no credentials)
+# 198 unit tests (fake provider — no network, no credentials)
 python -m unittest discover -s tests
 
-# 338 assertions against REAL servers on real sockets
+# 439 assertions against REAL servers on real sockets
 python scripts/smoke_http.py        #  74  the core API
 python scripts/smoke_mcp.py         #  82  the MCP tool surface
-python scripts/smoke_dashboard.py   # 138  the dashboard's endpoints + markup
-python scripts/smoke_dom.py         #  44  the dashboard's own JS, under node
+python scripts/smoke_dashboard.py   # 139  the dashboard's endpoints + markup
+python scripts/smoke_mfa.py         #  65  the second factor, over HTTP
+python scripts/smoke_dom.py         #  79  the dashboard's own JS, under node
 
 # 33 assertions on the DISTRIBUTION: build a wheel, install it into a clean
 # venv, and drive the installed copy. Needs network and ~300MB of scratch.
@@ -476,7 +541,7 @@ tool it cannot be talked into trying.
 
 ## The dashboard
 
-`GET /` serves one file — `aibank/static/dashboard.html`, ~31KB of plain
+`GET /` serves one file — `aibank/static/dashboard.html`, ~40KB of plain
 HTML/CSS/JS. No build step, no bundler, no CDN, no framework. The whole UI is
 one `GET /v1/dashboard` call: wallet, agents with their policies, pending
 approvals, recent payments.
@@ -491,6 +556,14 @@ approvals, recent payments.
   a human can catch an agent paying the wrong account is at approval, so the
   destination is recorded on the payout itself rather than looked up from a
   saved payee.
+- A **Security card** sits on the main dashboard, not in a buried settings
+  page: turning on two-step verification, rotating recovery codes, and removing
+  the factor. The card states what is at stake when the factor is off — "your
+  password alone can sign in and change every agent's limits" — because the
+  cost of leaving it off is not obvious from the toggle itself.
+- The code prompt is a **separate view** from the sign-in card, since the
+  password has already been accepted by then. The half-authenticated challenge
+  token is held in memory only and never written to `sessionStorage`.
 
 Testing a UI without a browser on the host is the awkward part, so it is done in
 two layers. `smoke_dashboard.py` proves every endpoint the page calls is
@@ -522,6 +595,10 @@ python3 scripts/demo/serve_demo.py      # prints a URL and a password
 POST   /v1/auth/register                 POST   /v1/auth/login
 POST   /v1/auth/logout                   POST   /v1/auth/password
 
+GET    /v1/auth/mfa                      POST   /v1/auth/mfa/enrol
+POST   /v1/auth/mfa/confirm              POST   /v1/auth/mfa/verify
+POST   /v1/auth/mfa/disable              POST   /v1/auth/mfa/recovery-codes
+
 GET    /v1/dashboard                     GET    /v1/me
 GET    /v1/wallet                        POST   /v1/wallet/deposit      (admin)
 GET    /v1/agents                        POST   /v1/agents
@@ -546,7 +623,8 @@ GET    /health                            GET    /  ·  /dashboard  (the UI)
 | path | purpose |
 |---|---|
 | `aibank/ledger.py` | double-entry core, holds, reversals, idempotency |
-| `aibank/users.py` | account holders, scrypt, sessions, lockout |
+| `aibank/users.py` | account holders, scrypt, sessions, lockout, 2FA |
+| `aibank/totp.py` | RFC 6238 TOTP, sealed secrets, recovery codes |
 | `aibank/policy.py` | spend-policy evaluation, timezone-correct windows |
 | `aibank/fees.py` | server-side pricing — never caller-supplied |
 | `aibank/bank.py` | agents, keys, funding, payouts, approvals, sweeper |
@@ -561,11 +639,11 @@ GET    /health                            GET    /  ·  /dashboard  (the UI)
 | `deploy/quickstart.sh` | clone to running service in one command |
 | `deploy/nginx.conf` | TLS termination, edge rate limit, unspoofable `X-Forwarded-For` |
 | `deploy/systemd/` | unit plus sweep and backup timers, hardened |
-| `scripts/smoke_*.py` | 338 assertions against live servers |
+| `scripts/smoke_*.py` | 439 assertions against live servers |
 | `scripts/smoke_package.py` | 33 assertions against the built-and-installed wheel |
 | `scripts/dom_check.mjs` | runs the page's real JS against a minimal DOM |
 | `scripts/demo/` | one-command demo: fake provider, seeded data, no credential |
-| `tests/` | 148 tests, including the concurrency and packaging suites |
+| `tests/` | 198 tests, including the concurrency, 2FA and packaging suites |
 
 ## Known limits
 
@@ -600,9 +678,6 @@ Stated plainly rather than discovered later:
   live call — so the adapter is the least-proven layer in the codebase, and it
   is the one that moves money. Get sandbox credentials and run one real
   transfer and one real webhook before trusting it.
-- **No 2FA on the human session**, which is the session that sets the limits.
-  Password plus durable per-account and per-address lockout is the whole story
-  today.
 - **No email verification and no password reset.** An operator can create and
   reset accounts with the CLI; account holders cannot recover their own.
 - **No metrics or structured logging.** `/health` reports the schema version,

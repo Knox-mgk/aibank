@@ -80,6 +80,12 @@ class Node {
   }
   setAttribute(k, v) { this.attributes[k] = String(v); }
   getAttribute(k) { return this.attributes[k] ?? null; }
+  // Real inputs expose focus()/blur(). Omitting them makes the page throw a
+  // TypeError out of its own error handler -- so a flow that merely wanted to
+  // re-focus a field after a bad code crashes the whole run, and the stack
+  // points at the harness rather than at anything wrong with the page.
+  focus() { this._focused = true; }
+  blur() { this._focused = false; }
   addEventListener(ev, fn) { (this._listeners[ev] ||= []).push(fn); }
   async click() {
     for (const fn of this._listeners.click || []) await fn({ key: "click" });
@@ -159,9 +165,19 @@ const storage = () => {
 const CONFIRMS = { answer: true, count: 0 };
 const FETCHES = [];
 
+// window.prompt is how the security card re-asks for the password before
+// enrolling or removing the factor. A queue rather than a fixed value: the
+// disable flow asks twice (password, then code) and returning the same string
+// to both would silently test the wrong thing.
+const PROMPTS = { queue: [], asked: [] };
+
 const window = {
   scrollTo() {},
   confirm(msg) { CONFIRMS.count++; CONFIRMS.last = msg; return CONFIRMS.answer; },
+  prompt(msg) {
+    PROMPTS.asked.push(msg);
+    return PROMPTS.queue.length ? PROMPTS.queue.shift() : null;
+  },
 };
 
 globalThis.document = document;
@@ -427,7 +443,181 @@ check("allocate carried an idempotency key",
       typeof allocBody.idempotency_key === "string" &&
       allocBody.idempotency_key.length > 5, true);
 
+/* ------------------------------------------------- second factor, in the UI */
+// The backend smoke test proves the endpoints. This proves the PAGE can drive
+// the two-step flow -- which is where a second factor usually breaks in
+// practice: the server returns a challenge instead of a session and the client
+// stores `undefined`, so the user appears signed in and every request 401s.
+const secBox = byId.get("security");
+check("security card rendered", secBox.children.length >= 1, true);
+check("reports the factor is off",
+      secBox.textContent.includes("Two-step verification is off"), true);
+check("and says why it matters",
+      secBox.textContent.includes("stolen password"), true);
+
+// Declining the password prompt must not call the API at all.
+const nSec = FETCHES.length;
+PROMPTS.queue = [];
+await secBox.buttons("Turn on two-step verification")[0].click();
+await settle();
+check("cancelling the password prompt issues NO request", FETCHES.length, nSec);
+check("the prompt asked for the password",
+      /password/i.test(PROMPTS.asked.at(-1) || ""), true);
+
+PROMPTS.queue = [PASSWORD];
+await secBox.buttons("Turn on two-step verification")[0].click();
+await settle();
+const enrolCall = FETCHES.find((f) => f.path === "/v1/auth/mfa/enrol");
+check("enrol POSTed", !!enrolCall, true);
+check("enrol sent the password",
+      JSON.parse(enrolCall?.body || "{}").current_password, PASSWORD);
+check("the secret is shown for manual entry",
+      /[A-Z2-7]{32}/.test(secBox.textContent), true);
+check("and warns the factor is not active yet",
+      secBox.textContent.includes("NOT active until you do"), true);
+
+// Compute a real code the way an authenticator would, so the confirm step is
+// exercised for real rather than stubbed.
+const secretMatch = /[A-Z2-7]{32}/.exec(secBox.textContent);
+const SECRET = secretMatch[0];
+const b32decode = (s) => {
+  const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = 0, acc = 0;
+  const out = [];
+  for (const ch of s.replace(/=+$/, "")) {
+    acc = (acc << 5) | A.indexOf(ch);
+    bits += 5;
+    if (bits >= 8) { bits -= 8; out.push((acc >> bits) & 0xff); }
+  }
+  return Buffer.from(out);
+};
+const { createHmac } = await import("node:crypto");
+const totp = (secret, step = 0) => {
+  const counter = Math.floor(Date.now() / 1000 / 30) + step;
+  const buf = Buffer.alloc(8);
+  buf.writeUInt32BE(Math.floor(counter / 2 ** 32), 0);
+  buf.writeUInt32BE(counter % 2 ** 32, 4);
+  const mac = createHmac("sha1", b32decode(secret)).update(buf).digest();
+  const off = mac[mac.length - 1] & 0x0f;
+  const code = mac.readUInt32BE(off) & 0x7fffffff;
+  return String(code % 1e6).padStart(6, "0");
+};
+
+// A wrong code must not activate it.
+const codeInput = secBox.find((n) => n.tagName === "INPUT").at(-1);
+codeInput.value = "000000";
+await secBox.buttons("Confirm")[0].click();
+await settle();
+check("a wrong confirm code flashes an error",
+      (byId.get("flash").textContent || "").length > 0, true);
+check("and the secret panel is still showing (not activated)",
+      secBox.textContent.includes("Add this to your authenticator app"), true);
+
+codeInput.value = totp(SECRET);
+await secBox.buttons("Confirm")[0].click();
+await settle();
+check("confirm POSTed", FETCHES.some((f) => f.path === "/v1/auth/mfa/confirm"),
+      true);
+check("recovery codes are displayed once",
+      (secBox.textContent.match(/[a-z2-9]{4}-[a-z2-9]{4}-[a-z2-9]{4}/g) || []).length,
+      10);
+check("with a save-them-now warning",
+      secBox.textContent.includes("shown once"), true);
+
+/* -------------------------------- the two-step sign-in, through the page */
+const RECOVERY = secBox.textContent
+  .match(/[a-z2-9]{4}-[a-z2-9]{4}-[a-z2-9]{4}/g);
+
+await byId.get("logout").click();
+await settle();
+
+byId.get("email").value = EMAIL;
+byId.get("password").value = PASSWORD;
+await byId.get("dologin").click();
+await settle();
+
+// THE property, as the user experiences it: the password gets them to the code
+// prompt, not to the dashboard.
+check("password alone lands on the code prompt",
+      byId.get("mfaview").classList.contains("hidden"), false);
+check("dashboard NOT shown after password only",
+      byId.get("dashview").classList.contains("hidden"), true);
+check("auth view hidden", byId.get("authview").classList.contains("hidden"), true);
+check("no session token stored yet",
+      globalThis.sessionStorage.getItem("aibank_token"), null);
+check("password field cleared", byId.get("password").value, "");
+
+// A wrong code keeps them on the prompt.
+byId.get("mfacode").value = "000000";
+await byId.get("domfa").click();
+await settle();
+check("a wrong code keeps the prompt up",
+      byId.get("mfaview").classList.contains("hidden"), false);
+check("and shows an error", (byId.get("flash").textContent || "").length > 0, true);
+check("and clears the field for retyping", byId.get("mfacode").value, "");
+
+// The real code gets them in. One step ahead: confirming enrolment spent the
+// current one, which is exactly what a real user hits.
+byId.get("mfacode").value = totp(SECRET, 1);
+await byId.get("domfa").click();
+await settle();
+check("verify POSTed",
+      FETCHES.some((f) => f.path === "/v1/auth/mfa/verify"), true);
+check("dashboard now visible",
+      byId.get("dashview").classList.contains("hidden"), false);
+check("code prompt hidden", byId.get("mfaview").classList.contains("hidden"), true);
+check("session token stored",
+      (globalThis.sessionStorage.getItem("aibank_token") || "").startsWith("sess_"),
+      true);
+check("security card now reports the factor is ON",
+      byId.get("security").textContent.includes("Two-step verification is on"),
+      true);
+
+/* ------------------------------------- recovery code sign-in warns loudly */
+await byId.get("logout").click();
+await settle();
+byId.get("email").value = EMAIL;
+byId.get("password").value = PASSWORD;
+await byId.get("dologin").click();
+await settle();
+byId.get("mfacode").value = RECOVERY[0];
+await byId.get("domfa").click();
+await settle();
+check("a recovery code signs in",
+      byId.get("dashview").classList.contains("hidden"), false);
+check("and the page says how many are left",
+      /\d+ left/.test(byId.get("flash").textContent || ""), true);
+
+/* ------------------------------ password alone cannot remove the factor */
+const secBox2 = byId.get("security");
+PROMPTS.queue = [PASSWORD, "000000"];
+await secBox2.buttons("Turn off")[0].click();
+await settle();
+check("a bad code cannot disable it",
+      byId.get("dashview").classList.contains("hidden"), false);
+check("and the error is shown",
+      (byId.get("flash").textContent || "").length > 0, true);
+
+PROMPTS.queue = [PASSWORD, RECOVERY[1]];
+await secBox2.buttons("Turn off")[0].click();
+await settle();
+check("disable POSTed",
+      FETCHES.some((f) => f.path === "/v1/auth/mfa/disable"), true);
+// Disabling revokes every session, so the page must drop back to sign-in
+// rather than pretend it is still authenticated.
+check("page returns to sign-in after disabling",
+      byId.get("authview").classList.contains("hidden"), false);
+check("token cleared after disabling",
+      globalThis.sessionStorage.getItem("aibank_token"), null);
+
 /* ---------------------------------------------------------- sign out */
+byId.get("email").value = EMAIL;
+byId.get("password").value = PASSWORD;
+await byId.get("dologin").click();
+await settle();
+check("password-only sign-in works again after disabling",
+      byId.get("dashview").classList.contains("hidden"), false);
+
 await byId.get("logout").click();
 await settle();
 check("logout POSTed",

@@ -348,11 +348,77 @@ CREATE INDEX IF NOT EXISTS idx_login_attempts_ip
     ON login_attempts(client_ip, created_at);
 """
 
+MIGRATION_5 = """
+-- SECOND FACTOR on the human session.
+--
+-- WHY on users and not a side table: enrolment state is one-to-one with the
+-- account and is read on every single sign-in, so a JOIN buys nothing and a
+-- missing row would be indistinguishable from "not enrolled" -- a failure mode
+-- that silently disables the factor.
+--
+-- `totp_secret_sealed` is never plaintext: it is sealed under
+-- AIBANK_KEY_PEPPER (see aibank/totp.py). A stolen database therefore yields
+-- no usable second factor, matching the guarantee the password hash and the
+-- API key hashes already make.
+--
+-- `totp_last_counter` is REPLAY PROTECTION, not bookkeeping. A code stays
+-- valid for up to 90 seconds, so without a high-water mark an observer who
+-- sees one code can reuse it. Refusing any counter <= this value makes every
+-- code single-use.
+ALTER TABLE users ADD COLUMN totp_secret_sealed TEXT;
+ALTER TABLE users ADD COLUMN totp_enrolled_at   TEXT;
+ALTER TABLE users ADD COLUMN totp_last_counter  INTEGER;
+
+-- Pending second-factor challenges: the password was correct, but no session
+-- exists yet.
+--
+-- WHY a table rather than a signed cookie or an in-memory dict: the challenge
+-- must be revocable and must not survive a restart as a valid credential, and
+-- the ATTEMPT COUNTER on it has to be durable. An in-process counter resets
+-- when the service restarts, which hands an online guesser unlimited tries at
+-- a 6-digit code -- the same bug that already made per-account login lockout
+-- dead code once.
+--
+-- The token is stored hashed, like sessions and API keys: a database dump must
+-- not yield a live half-authenticated credential.
+CREATE TABLE IF NOT EXISTS mfa_challenges (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL REFERENCES users(id),
+    token_hash  TEXT NOT NULL UNIQUE,
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    consumed_at TEXT,
+    client_ip   TEXT,
+    user_agent  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mfa_challenges_user
+    ON mfa_challenges(user_id, expires_at);
+
+-- Single-use recovery codes, so a lost phone is not a permanently frozen
+-- wallet with live agents still spending under limits nobody can change.
+-- Stored as peppered hashes and deleted-by-marking rather than DELETEd, so the
+-- audit trail can still show that a recovery code was burned and when.
+CREATE TABLE IF NOT EXISTS recovery_codes (
+    id         TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL REFERENCES users(id),
+    code_hash  TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    used_at    TEXT,
+    used_ip    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_recovery_codes_user
+    ON recovery_codes(user_id, used_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_recovery_codes_hash
+    ON recovery_codes(code_hash);
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, MIGRATION_1),
     (2, MIGRATION_2),
     (3, MIGRATION_3),
     (4, MIGRATION_4),
+    (5, MIGRATION_5),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]

@@ -126,6 +126,31 @@ td{padding:7px 8px;border-bottom:1px solid #1b2533;vertical-align:top}
     </div>
   </section>
 
+  <!-- ------------------------------------------------ second factor -->
+  <!-- A separate view, not a field on the sign-in card: the password has
+       already been accepted at this point, and showing it alongside the
+       password inputs invites the browser to re-submit both. -->
+  <section id="mfaview" class="center hidden">
+    <div class="card">
+      <h2>Two-step verification</h2>
+      <p class="small muted">
+        Enter the 6-digit code from your authenticator app.
+      </p>
+      <div style="margin-bottom:10px">
+        <label for="mfacode">Code</label>
+        <input id="mfacode" type="text" inputmode="numeric" autocomplete="one-time-code"
+               maxlength="14" placeholder="123456">
+      </div>
+      <div class="row">
+        <button id="domfa" class="primary">Verify</button>
+        <button id="cancelmfa">Cancel</button>
+      </div>
+      <p class="small muted" style="margin-bottom:0">
+        Lost your phone? Enter one of your recovery codes instead.
+      </p>
+    </div>
+  </section>
+
   <!-- ------------------------------------------------ dashboard -->
   <section id="dashview" class="hidden">
 
@@ -176,6 +201,11 @@ td{padding:7px 8px;border-bottom:1px solid #1b2533;vertical-align:top}
     </div>
 
     <div class="card">
+      <h2>Security</h2>
+      <div id="security"></div>
+    </div>
+
+    <div class="card">
       <h2>Recent payments</h2>
       <div id="payouts"></div>
     </div>
@@ -188,6 +218,7 @@ td{padding:7px 8px;border-bottom:1px solid #1b2533;vertical-align:top}
 /* ---------------------------------------------------------------- state */
 const S = {
   token: sessionStorage.getItem("aibank_token") || "",
+  challenge: "",          // half-authenticated: never persisted, dies with the page
   data: null,
   open: new Set(JSON.parse(sessionStorage.getItem("aibank_open") || "[]")),
   tab: {},
@@ -230,7 +261,12 @@ async function api(method, path, body, opts) {
   let j = {};
   try { j = txt ? JSON.parse(txt) : {}; } catch (e) { /* non-JSON body */ }
   if (!r.ok) {
-    if (r.status === 401 && S.token && !o.anon) { signOut(true); }
+    // Only a DEAD SESSION should sign the user out. Treating every 401 that
+    // way meant a mistyped one-time code -- also a 401 -- ejected the user to
+    // the sign-in screen and threw away their enrolment. The server now says
+    // which kind it is; anything else is shown inline for the user to retry.
+    if (r.status === 401 && j.error === "session_invalid" &&
+        S.token && !o.anon) { signOut(true); }
     const e = new Error(j.reason || j.error || ("HTTP " + r.status));
     e.status = r.status;
     throw e;
@@ -293,9 +329,20 @@ async function doAuth() {
     }
     const r = await api("POST", "/v1/auth/login", { email, password },
                         { anon: true });
+    $("password").value = "";
+
+    // Two-step: with a second factor enrolled the server deliberately returns
+    // NO session, only a short-lived challenge. Assigning r.session_token
+    // blindly here would store `undefined` and then "sign in" with no
+    // credential -- the page would look logged in and every request would 401.
+    if (r.mfa_required) {
+      S.challenge = r.challenge_token;
+      flash("");
+      showMfa();
+      return;
+    }
     S.token = r.session_token;
     sessionStorage.setItem("aibank_token", S.token);
-    $("password").value = "";
     flash("");
     await load();
   } catch (e) {
@@ -305,11 +352,66 @@ async function doAuth() {
   }
 }
 
+/* -------------------------------------------------------- second factor */
+function showMfa() {
+  $("authview").classList.add("hidden");
+  $("mfaview").classList.remove("hidden");
+  $("mfacode").value = "";
+  $("mfacode").focus();
+}
+
+$("domfa").addEventListener("click", doMfa);
+$("mfacode").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") doMfa();
+});
+$("cancelmfa").addEventListener("click", () => {
+  // Drop the challenge rather than keeping it around: it is a
+  // half-authenticated credential and nothing should hold one longer than the
+  // user is actively using it.
+  S.challenge = "";
+  $("mfaview").classList.add("hidden");
+  $("authview").classList.remove("hidden");
+  flash("");
+});
+
+async function doMfa() {
+  const code = $("mfacode").value.trim();
+  if (!code) return flash("Enter the code from your authenticator app.");
+  $("domfa").disabled = true;
+  try {
+    const r = await api("POST", "/v1/auth/mfa/verify",
+                        { challenge_token: S.challenge, code }, { anon: true });
+    S.challenge = "";
+    S.token = r.session_token;
+    sessionStorage.setItem("aibank_token", S.token);
+    $("mfaview").classList.add("hidden");
+    flash("");
+    await load();
+    if (r.used_recovery_code) {
+      // Say the number out loud: a user who silently burns through ten
+      // recovery codes discovers the problem only when they are locked out.
+      flash("You signed in with a recovery code. " +
+            r.recovery_codes_remaining + " left — generate a new set below.",
+            "ok");
+    }
+  } catch (e) {
+    flash(e.message);
+    $("mfacode").value = "";
+    $("mfacode").focus();
+  } finally {
+    $("domfa").disabled = false;
+  }
+}
+
 function signOut(expired) {
   S.token = "";
   S.data = null;
+  S.challenge = "";
   sessionStorage.removeItem("aibank_token");
   $("dashview").classList.add("hidden");
+  // The challenge view must be hidden too: a session that ends while the code
+  // prompt is up would otherwise leave the user typing into a dead challenge.
+  $("mfaview").classList.add("hidden");
   $("authview").classList.remove("hidden");
   $("refresh").classList.add("hidden");
   $("logout").classList.add("hidden");
@@ -350,7 +452,151 @@ async function load() {
   renderWallet();
   renderApprovals();
   renderAgents();
+  renderSecurity();
   renderPayouts();
+}
+
+/* -------------------------------------------------------------- security */
+// The whole product claim is that a human sets limits the agent cannot reach.
+// That rests on this one credential, so the card is deliberately on the main
+// dashboard rather than buried in a settings page nobody opens.
+async function renderSecurity() {
+  const box = $("security");
+  box.replaceChildren();
+  let st;
+  try {
+    st = await api("GET", "/v1/auth/mfa");
+  } catch (e) {
+    box.appendChild(el("p", "small muted", "Could not read security state."));
+    return;
+  }
+
+  const row = el("div", "row");
+  const left = el("div", "col");
+  left.appendChild(el("div", "big",
+    st.enabled ? "Two-step verification is on" : "Two-step verification is off"));
+  left.appendChild(el("div", "small muted", st.enabled
+    ? "A code from your authenticator is required to sign in. " +
+      st.recovery_codes_remaining + " recovery code" +
+      (st.recovery_codes_remaining === 1 ? "" : "s") + " unused."
+    : "Your password alone can sign in and change every agent's limits. " +
+      "Turning this on means a stolen password is not enough."));
+  row.appendChild(left);
+  box.appendChild(row);
+
+  const act = el("div", "row");
+  if (!st.enabled) {
+    const b = el("button", "primary", "Turn on two-step verification");
+    b.addEventListener("click", () => beginEnrol(box));
+    act.appendChild(b);
+  } else {
+    const d = el("button", "danger", "Turn off");
+    d.addEventListener("click", () => disableMfa(box));
+    const r = el("button", null, "New recovery codes");
+    r.addEventListener("click", () => rotateRecovery(box));
+    act.appendChild(d);
+    act.appendChild(r);
+  }
+  box.appendChild(act);
+}
+
+function askPassword(label) {
+  // Re-asking for the password is not friction for its own sake: without it a
+  // stolen session token could bind the attacker's own authenticator, or strip
+  // the factor off entirely.
+  return window.prompt(label);
+}
+
+function showCodes(box, codes, heading) {
+  const wrap = el("div", "tile");
+  wrap.appendChild(el("div", "big", heading));
+  wrap.appendChild(el("div", "small muted",
+    "Save these now — they are shown once and cannot be recovered. " +
+    "Each works a single time."));
+  const list = el("div", "mono");
+  codes.forEach((c) => list.appendChild(el("div", null, c)));
+  wrap.appendChild(list);
+  box.appendChild(wrap);
+}
+
+async function beginEnrol(box) {
+  const pw = askPassword("Confirm your password to turn on two-step verification");
+  if (!pw) return;
+  let start;
+  try {
+    start = await api("POST", "/v1/auth/mfa/enrol", { current_password: pw });
+  } catch (e) {
+    return flash(e.message);
+  }
+
+  const wrap = el("div", "tile");
+  wrap.appendChild(el("div", "big", "Add this to your authenticator app"));
+  wrap.appendChild(el("div", "small muted",
+    "Scan is unavailable here, so enter the key by hand. Then type the code " +
+    "it shows to confirm — the factor is NOT active until you do, so a " +
+    "mistyped key cannot lock you out."));
+  wrap.appendChild(el("div", "mono", start.secret));
+  wrap.appendChild(el("div", "small muted",
+    "Account " + start.account + " · " + start.digits + " digits · every " +
+    start.period + "s"));
+
+  const inp = el("input");
+  inp.placeholder = "123456";
+  inp.setAttribute("inputmode", "numeric");
+  inp.setAttribute("autocomplete", "one-time-code");
+  wrap.appendChild(inp);
+
+  const go = el("button", "primary", "Confirm");
+  go.addEventListener("click", async () => {
+    go.disabled = true;
+    try {
+      const done = await api("POST", "/v1/auth/mfa/confirm",
+                             { code: inp.value.trim() });
+      box.replaceChildren();
+      showCodes(box, done.recovery_codes, "Two-step verification is on");
+      flash("Two-step verification enabled.", "ok");
+    } catch (e) {
+      flash(e.message);
+    } finally {
+      go.disabled = false;
+    }
+  });
+  wrap.appendChild(go);
+  box.appendChild(wrap);
+}
+
+async function disableMfa(box) {
+  const pw = askPassword("Confirm your password to turn OFF two-step verification");
+  if (!pw) return;
+  // Both factors are required to remove a factor: a password thief must not be
+  // able to simply switch off the thing that stops them.
+  const code = window.prompt(
+    "Enter a current authenticator code, or one of your recovery codes");
+  if (!code) return;
+  try {
+    await api("POST", "/v1/auth/mfa/disable",
+              { current_password: pw, code: code.trim() });
+  } catch (e) {
+    return flash(e.message);
+  }
+  // Disabling revokes every session, including this one, so the page must go
+  // back to sign-in rather than pretend it is still authenticated.
+  signOut(false);
+  flash("Two-step verification turned off. Sign in again.", "ok");
+}
+
+async function rotateRecovery(box) {
+  const pw = askPassword("Confirm your password to generate new recovery codes");
+  if (!pw) return;
+  try {
+    const r = await api("POST", "/v1/auth/mfa/recovery-codes",
+                        { current_password: pw });
+    box.replaceChildren();
+    showCodes(box, r.recovery_codes, "New recovery codes");
+    flash("Previous recovery codes no longer work.", "ok");
+  } catch (e) {
+    flash(e.message);
+  }
 }
 
 /* ---------------------------------------------------------------- render */
