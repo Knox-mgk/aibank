@@ -311,15 +311,39 @@ class Bank:
 
     def add_payee(self, agent_id: str, label: str, bank_code: str,
                   account_number: str, currency: str = "NGN") -> str:
+        """Register a payout destination, idempotently.
+
+        The same (agent, bank, account, currency) is the SAME payee, so
+        re-registering it returns the existing id rather than failing. It used
+        to raise `sqlite3.IntegrityError` straight through the handler as a
+        bare HTTP 500 "internal", which is wrong three ways: a retry is normal
+        agent behaviour (the first response can be lost exactly as a payout's
+        can), a 500 invites the caller to retry a request that will never
+        succeed, and it leaks a schema detail as an unhandled crash. Same
+        refusal-to-punish-a-retry as the payout idempotency path.
+
+        The label is NOT part of the identity -- the money lands on the account
+        number, so two labels for one account must not create two payees that
+        policy allowlists would then have to track separately.
+        """
         currency = check_currency(currency)
         payee_id = L.new_id("payee")
         with self.db.write() as conn:
-            conn.execute(
-                "INSERT INTO payees (id, agent_id, label, bank_code, account_number,"
-                " currency, created_at) VALUES (?,?,?,?,?,?,?)",
-                (payee_id, agent_id, label, bank_code, account_number, currency,
-                 L.now_iso()),
-            )
+            try:
+                conn.execute(
+                    "INSERT INTO payees (id, agent_id, label, bank_code,"
+                    " account_number, currency, created_at) VALUES (?,?,?,?,?,?,?)",
+                    (payee_id, agent_id, label, bank_code, account_number,
+                     currency, L.now_iso()),
+                )
+            except sqlite3.IntegrityError:
+                row = conn.execute(
+                    "SELECT id FROM payees WHERE agent_id=? AND bank_code=?"
+                    " AND account_number=? AND currency=?",
+                    (agent_id, bank_code, account_number, currency)).fetchone()
+                if row is None:
+                    raise
+                return row["id"]
         return payee_id
 
     def list_payees(self, agent_id: str) -> list[dict]:

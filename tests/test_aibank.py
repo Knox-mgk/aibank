@@ -170,6 +170,54 @@ class TestPolicy(BankTestCase):
         with self.assertRaises(PolicyDenied):
             self.bank.request_payout(a["agent_id"], "100", payee_id=victim)
 
+    def test_re_registering_the_same_payee_returns_the_same_id(self):
+        """A retried payee registration is not a server error.
+
+        The uniqueness constraint reached the HTTP layer as a bare 500
+        "internal": an agent whose first registration response was lost had no
+        way forward, since every retry crashed and the 500 invited yet another.
+        Re-registering the same destination now returns the existing id.
+        """
+        ag = self.bank.create_agent("retry", daily_max="100000")
+        first = self.bank.add_payee(ag["agent_id"], "vendor", "044", "1234567890")
+        again = self.bank.add_payee(ag["agent_id"], "vendor", "044", "1234567890")
+        self.assertEqual(first, again)
+        self.assertEqual(len(self.bank.list_payees(ag["agent_id"])), 1)
+
+    def test_same_account_under_a_new_label_is_not_a_second_payee(self):
+        """Identity is the account, not the label.
+
+        Money lands on the account number, so a relabelled registration must
+        not create a second payee -- an allowlist would otherwise have to track
+        two rows for one real destination.
+        """
+        ag = self.bank.create_agent("relabel", daily_max="100000")
+        first = self.bank.add_payee(ag["agent_id"], "vendor", "044", "1234567890")
+        relabelled = self.bank.add_payee(ag["agent_id"], "Vendor Ltd", "044", "1234567890")
+        self.assertEqual(first, relabelled)
+        self.assertEqual(len(self.bank.list_payees(ag["agent_id"])), 1)
+
+    def test_a_different_account_is_a_different_payee(self):
+        """The idempotency must not collapse genuinely distinct destinations."""
+        ag = self.bank.create_agent("distinct", daily_max="100000")
+        one = self.bank.add_payee(ag["agent_id"], "v", "044", "1111111111")
+        two = self.bank.add_payee(ag["agent_id"], "v", "044", "2222222222")
+        three = self.bank.add_payee(ag["agent_id"], "v", "058", "1111111111")
+        self.assertEqual(len({one, two, three}), 3)
+
+    def test_payees_are_not_shared_across_agents(self):
+        """Two agents registering the same account get their OWN payee rows.
+
+        The constraint is per-agent, so collapsing on (bank, account) alone
+        would hand one agent a reference to another's destination -- which
+        `test_cannot_pay_another_agents_payee` exists to prevent.
+        """
+        a = self.bank.create_agent("a2", daily_max="100000")
+        b = self.bank.create_agent("b2", daily_max="100000")
+        mine = self.bank.add_payee(a["agent_id"], "v", "044", "1234567890")
+        theirs = self.bank.add_payee(b["agent_id"], "v", "044", "1234567890")
+        self.assertNotEqual(mine, theirs)
+
     def test_approval_threshold(self):
         ag = self.bank.create_agent("t", daily_max="1000000",
                                     require_approval_above="50000")
