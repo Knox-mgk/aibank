@@ -125,6 +125,21 @@ slow or failed provider response can never leave the ledger overdrawn. Webhook
 delivery is treated as unreliable: duplicates are expected and settle exactly
 once.
 
+A failed submit is two different events, and conflating them is a money bug:
+
+- The provider **replied and refused** (HTTP 4xx/5xx with a body — "invalid
+  account", "insufficient merchant balance", "enable IP whitelisting"). Nothing
+  was queued, so the payout fails and the hold is released immediately.
+- The provider **did not reply** (connection error, socket timeout, an
+  unreadable 200). The request may have arrived and the transfer may already be
+  queued — the response is simply lost. The payout is left non-terminal, the
+  **hold is kept**, and it goes into the reconciliation queue. Releasing it
+  there would let the agent respend money that is on its way out, and the
+  second spend would be backed by nothing.
+
+`FlutterwaveError.indeterminate` carries that distinction and callers must
+branch on it.
+
 Holds carry an expiry. Without one, a webhook that never arrives freezes that
 money permanently. `sweep-holds` releases expired holds and flags the payout for
 reconciliation rather than declaring it failed — we do not know whether the
@@ -672,12 +687,19 @@ Stated plainly rather than discovered later:
   the wire in clear is the whole account. `compose.yaml` and
   `deploy/nginx.conf` do this, and the compose service publishes no port of its
   own so it cannot be reached around the proxy.
-- **The real Flutterwave API has never been called.** Every provider reference
-  in the tests and smoke scripts uses a fake. Field names, error shapes, status
-  strings and webhook payloads are taken from the documentation, not from a
-  live call — so the adapter is the least-proven layer in the codebase, and it
-  is the one that moves money. Get sandbox credentials and run one real
-  transfer and one real webhook before trusting it.
+- **The real Flutterwave API has been called for READS only.** Against a live
+  sandbox key the adapter's auth, JSON handling and response shapes are
+  confirmed on `GET /banks` (598 Nigerian banks), `GET /balances/NGN`
+  (`available_balance` / `ledger_balance` / `currency`) and
+  `POST /accounts/resolve` (`account_name` / `account_number`). Every test and
+  smoke script still uses a fake, and the paths that MOVE money are still
+  unproven end to end: `POST /transfers` is refused by the sandbox with
+  `{"status":"error","message":"Please enable IP Whitelisting to access this
+  service","data":null}` (HTTP 400) until the account whitelists the caller's
+  address, and no real webhook has ever been delivered. So transfer field
+  names, success-status strings and webhook payloads remain documentation-
+  derived. Whitelist an address, run one real transfer and one real webhook
+  before trusting it with money.
 - **No email verification and no password reset.** An operator can create and
   reset accounts with the CLI; account holders cannot recover their own.
 - **No metrics or structured logging.** `/health` reports the schema version,

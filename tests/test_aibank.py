@@ -280,14 +280,107 @@ class TestPayoutLifecycle(BankTestCase):
             for _ in range(10):
                 self.bank.request_payout(self.ag["agent_id"], "30000", payee_id=self.payee)
 
-    def test_network_failure_releases_hold(self):
+    def test_network_failure_KEEPS_hold_and_queues_reconciliation(self):
+        """A lost response must NOT release the money.
+
+        This test previously asserted the opposite -- that a network failure
+        fails the payout and returns the funds -- and that is why 198 green
+        tests never caught it. The fake raises `URLError`, i.e. the request
+        went out and NO reply came back, so Flutterwave may have queued the
+        transfer. Releasing the hold there lets the agent spend the same money
+        again while the first transfer is still in flight, and the second
+        spend is backed by nothing.
+
+        The hold sweeper already encodes the correct principle in its own
+        docstring ("deciding failed here could release funds that actually
+        left"); `_submit` contradicted it.
+        """
         bank, fake = make_bank(fail_on_transfer=True)
         ag = bank.create_agent("t", per_txn_max="50000", daily_max="200000")
         bank.fund_agent(ag["agent_id"], "100000")
         payee = bank.add_payee(ag["agent_id"], "v", "044", "1234567890")
         out = bank.request_payout(ag["agent_id"], "20000", payee_id=payee)
-        self.assertEqual(out["status"], "failed")
-        self.assertEqual(bank.balance(ag["agent_id"])["available_minor"], 10000000)
+
+        # NOT terminal: a late webhook must still be able to settle it.
+        self.assertNotIn(out["status"], ("failed", "successful"))
+        # The hold is still in force, so the money is NOT respendable.
+        bal = bank.balance(ag["agent_id"])
+        self.assertEqual(bal["available_minor"], 8000000)
+        self.assertEqual(bal["balance_minor"], 10000000)
+        # And an operator is actually told, rather than the ticket going in a
+        # drawer nobody opens.
+        pending = [p["id"] for p in bank.needs_reconciliation()]
+        self.assertIn(out["id"], pending)
+
+    def test_indeterminate_payout_cannot_be_respent(self):
+        """The consequence that makes the bug expensive, asserted directly."""
+        bank, fake = make_bank(fail_on_transfer=True)
+        ag = bank.create_agent("t", per_txn_max="150000", daily_max="500000")
+        bank.fund_agent(ag["agent_id"], "100000")
+        payee = bank.add_payee(ag["agent_id"], "v", "044", "1234567890")
+        bank.request_payout(ag["agent_id"], "60000", payee_id=payee)
+        # 60k of a 100k wallet is in limbo; a second 60k must be refused.
+        with self.assertRaises(InsufficientFunds):
+            bank.request_payout(ag["agent_id"], "60000", payee_id=payee)
+
+    def test_timeout_is_indeterminate_not_a_refusal(self):
+        """A bare socket timeout must not read as a provider rejection.
+
+        urllib raises TimeoutError rather than URLError when the socket times
+        out mid-read -- precisely the case where the transfer is most likely
+        already queued. Without its own except branch this escaped as an
+        unhandled exception instead of being classified.
+        """
+        from aibank.flutterwave import FlutterwaveClient, FlutterwaveError
+
+        def timeout_opener(req, timeout=None):
+            raise TimeoutError("timed out")
+
+        c = FlutterwaveClient("FLWSECK_TEST-x", opener=timeout_opener)
+        with self.assertRaises(FlutterwaveError) as cm:
+            c.initiate_transfer(bank_code="044", account_number="1234567890",
+                                amount_major=100, currency="NGN", reference="r1")
+        self.assertTrue(cm.exception.indeterminate)
+
+    def test_http_error_is_definite_so_hold_is_released(self):
+        """The other side of the branch: a REPLY means the provider decided."""
+        from aibank.flutterwave import FlutterwaveClient, FlutterwaveError
+        import io
+        import urllib.error
+
+        def http_opener(req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url, 400, "Bad Request", {},
+                io.BytesIO(b'{"status":"error","message":"invalid account"}'))
+
+        c = FlutterwaveClient("FLWSECK_TEST-x", opener=http_opener)
+        with self.assertRaises(FlutterwaveError) as cm:
+            c.initiate_transfer(bank_code="044", account_number="0000000000",
+                                amount_major=100, currency="NGN", reference="r2")
+        self.assertFalse(cm.exception.indeterminate)
+        self.assertEqual(cm.exception.status, 400)
+
+    def test_unreadable_200_body_is_indeterminate(self):
+        """A 200 carrying an HTML proxy error page may still have succeeded."""
+        from aibank.flutterwave import FlutterwaveClient, FlutterwaveError
+        import io
+
+        class Resp(io.BytesIO):
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                self.close()
+                return False
+
+        c = FlutterwaveClient("FLWSECK_TEST-x",
+                              opener=lambda req, timeout=None: Resp(b"<html>502</html>"))
+        with self.assertRaises(FlutterwaveError) as cm:
+            c.initiate_transfer(bank_code="044", account_number="1234567890",
+                                amount_major=100, currency="NGN", reference="r3")
+        self.assertTrue(cm.exception.indeterminate)
 
     def test_provider_http_error_releases_hold(self):
         bank, fake = make_bank(http_error=400)

@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import json
 import os
+import socket
 import urllib.error
 import urllib.request
 
@@ -25,9 +26,31 @@ API_BASE = os.environ.get("FLW_BASE_URL", "https://api.flutterwave.com/v3")
 
 
 class FlutterwaveError(Exception):
-    def __init__(self, message: str, status: int | None = None, payload=None):
+    """A provider call failed.
+
+    `indeterminate` is the load-bearing field, and the distinction is the
+    difference between releasing money correctly and releasing money that has
+    already left:
+
+    - An HTTP error carries a REPLY. Flutterwave parsed the request and
+      refused it ("invalid account", "Insufficient funds in merchant
+      balance", "Please enable IP Whitelisting" — all real, all observed
+      against the live sandbox). Nothing was queued, so failing the payout and
+      releasing the hold is correct.
+    - A NETWORK error carries no reply. The request may have arrived and the
+      transfer may be queued; the response is simply lost. Declaring that
+      failed and releasing the hold lets the agent respend money that is on
+      its way out, and the second spend is backed by nothing.
+
+    So: HTTP -> definite, network/timeout -> indeterminate. Callers must branch
+    on it rather than treating every exception as a rejection.
+    """
+
+    def __init__(self, message: str, status: int | None = None, payload=None,
+                 indeterminate: bool = False):
         super().__init__(message)
         self.status, self.payload = status, payload
+        self.indeterminate = indeterminate
 
 
 class FlutterwaveClient:
@@ -57,10 +80,26 @@ class FlutterwaveClient:
                 payload = json.loads(raw)
             except ValueError:
                 payload = {"raw": raw}
+            # A reply arrived: the provider decided. Definite.
             raise FlutterwaveError(
                 payload.get("message", f"HTTP {exc.code}"), exc.code, payload) from exc
         except urllib.error.URLError as exc:
-            raise FlutterwaveError(f"network error: {exc.reason}") from exc
+            # No reply. Reachability failed, or the response was lost in
+            # flight — we cannot know whether the provider acted.
+            raise FlutterwaveError(f"network error: {exc.reason}",
+                                   indeterminate=True) from exc
+        except (TimeoutError, socket.timeout) as exc:
+            # urllib raises a bare timeout rather than URLError when the socket
+            # times out mid-read, which is EXACTLY the case where a transfer is
+            # most likely already queued. Missing this branch is what made a
+            # lost response indistinguishable from a refusal.
+            raise FlutterwaveError(f"timeout after {self.timeout}s",
+                                   indeterminate=True) from exc
+        except (json.JSONDecodeError, ValueError) as exc:
+            # 200 with an unparseable body (an HTML error page from a proxy, a
+            # truncated read). The call may well have succeeded.
+            raise FlutterwaveError(f"unreadable provider response: {exc}",
+                                   indeterminate=True) from exc
 
     # --- payouts -------------------------------------------------------
     def initiate_transfer(self, *, bank_code: str, account_number: str,

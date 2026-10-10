@@ -691,7 +691,21 @@ class Bank:
                 meta={"payout_id": payout_id, "agent_id": p["agent_id"]},
             )
         except FlutterwaveError as exc:
-            # Provider rejected it outright -> nothing left, release the hold.
+            if exc.indeterminate:
+                # NO reply from the provider, so the transfer may already be
+                # queued. Releasing the hold here would let the agent respend
+                # money that is on its way out of the wallet, and the ledger
+                # would be short by the amount once the webhook landed.
+                #
+                # So: keep the hold, leave the payout non-terminal, and put it
+                # in the reconciliation queue -- the same refusal-to-guess the
+                # hold sweeper already makes. An operator (or `cli reconcile`)
+                # asks the provider what actually happened. The money stays
+                # immobilised until someone knows, which is the correct bias
+                # when the alternative is spending it twice.
+                self._mark_indeterminate(payout_id, f"provider unreachable: {exc}")
+                return self.get_payout(payout_id)
+            # A reply arrived and the provider refused: nothing was queued.
             self._fail(payout_id, f"provider error: {exc}")
             return self.get_payout(payout_id)
 
@@ -732,6 +746,36 @@ class Bank:
                 "UPDATE payouts SET status='successful', provider_status='SUCCESSFUL',"
                 " updated_at=? WHERE id=?", (L.now_iso(), payout_id))
             L.audit(conn, p["agent_id"], "payout.settled", "ok", {"payout_id": payout_id})
+        finally:
+            if owns_txn:
+                ctx.__exit__(None, None, None)
+
+    def _mark_indeterminate(self, payout_id: str, reason: str, conn=None) -> None:
+        """Provider outcome unknown: KEEP the hold, queue for reconciliation.
+
+        The deliberate omission here is the whole point -- this never calls
+        `L.release_hold`. The agent's money stays immobilised because the
+        transfer may be in flight, and an operator resolves it via
+        `needs_reconciliation` / `reconcile`.
+
+        The reason text must contain "needs reconciliation": that substring is
+        the `needs_reconciliation()` predicate, so an indeterminate payout that
+        omitted it would sit in a non-terminal state forever with nothing
+        surfacing it -- money frozen and nobody told. Status stays non-terminal
+        so a late webhook can still settle it normally.
+        """
+        owns_txn = conn is None
+        if owns_txn:
+            ctx = self.db.write(); conn = ctx.__enter__()
+        try:
+            p = conn.execute("SELECT * FROM payouts WHERE id = ?", (payout_id,)).fetchone()
+            if p["status"] in ("failed", "successful", "rejected", "refunded"):
+                return
+            conn.execute(
+                "UPDATE payouts SET failure_reason=?, updated_at=? WHERE id=?",
+                (f"{reason}; needs reconciliation", L.now_iso(), payout_id))
+            L.audit(conn, p["agent_id"], "payout.indeterminate", reason,
+                    {"payout_id": payout_id, "hold_kept": True})
         finally:
             if owns_txn:
                 ctx.__exit__(None, None, None)
