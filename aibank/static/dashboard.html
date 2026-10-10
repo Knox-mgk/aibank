@@ -36,6 +36,10 @@ header .sp{flex:1}
 .muted{color:var(--dim)}
 .small{font-size:13px}
 .mono{font-family:var(--mono);font-size:12.5px}
+.qrbox{margin:14px 0;display:flex;justify-content:center}
+/* The white plate is part of the symbol, not decoration: a QR needs a light
+   quiet zone on all four sides and this page is dark. */
+.qrbox svg{background:#fff;border-radius:6px;padding:0;max-width:100%;height:auto}
 main{max-width:1000px;margin:0 auto;padding:18px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
   padding:16px;margin-bottom:16px}
@@ -231,6 +235,59 @@ const el = (tag, cls, txt) => {
   if (txt !== undefined) n.textContent = txt;   // textContent, never innerHTML
   return n;
 };
+
+/* --------------------------------------------------------------- QR code */
+/* The server sends MODULES ('0'/'1' rows), never markup, and this builds the
+   SVG with DOM calls -- no innerHTML, no third-party script. That is the whole
+   reason the symbol is generated server-side: `script-src 'self'` on the page
+   that sets an account's spending limits is a security property, and a QR
+   library would be the first script to break it. */
+const SVGNS = "http://www.w3.org/2000/svg";
+
+function qrNode(rows) {
+  if (!rows || !rows.length) return null;          // older server: key only
+  const n = rows.length;
+  const quiet = 4;                                 // required, or it won't scan
+  const dim = n + quiet * 2;
+  const svg = document.createElementNS(SVGNS, "svg");
+  svg.setAttribute("viewBox", "0 0 " + dim + " " + dim);
+  svg.setAttribute("width", "232");
+  svg.setAttribute("height", "232");
+  svg.setAttribute("shape-rendering", "crispEdges");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "Two-step verification setup code");
+  svg.setAttribute("class", "qr");
+
+  const bg = document.createElementNS(SVGNS, "rect");
+  bg.setAttribute("width", String(dim));
+  bg.setAttribute("height", String(dim));
+  /* White, not the panel colour: scanners expect a light quiet zone, and a
+     dark-themed page would otherwise produce a symbol nothing can read. */
+  bg.setAttribute("fill", "#ffffff");
+  svg.appendChild(bg);
+
+  /* One path of horizontal runs rather than a rect per module: a version-8
+     symbol is ~2400 modules, and 2400 nodes is a visible stall on a phone. */
+  let d = "";
+  for (let r = 0; r < n; r++) {
+    const row = rows[r];
+    for (let c = 0; c < n; c++) {
+      if (row[c] !== "1") continue;
+      let run = 1;
+      while (c + run < n && row[c + run] === "1") run++;
+      d += "M" + (c + quiet) + " " + (r + quiet) + "h" + run + "v1h-" + run + "z";
+      c += run - 1;
+    }
+  }
+  const path = document.createElementNS(SVGNS, "path");
+  path.setAttribute("fill", "#000000");
+  path.setAttribute("d", d);
+  svg.appendChild(path);
+
+  const box = el("div", "qrbox");
+  box.appendChild(svg);
+  return box;
+}
 
 function flash(msg, kind) {
   const f = $("flash");
@@ -532,9 +589,11 @@ async function beginEnrol(box) {
   const wrap = el("div", "tile");
   wrap.appendChild(el("div", "big", "Add this to your authenticator app"));
   wrap.appendChild(el("div", "small muted",
-    "Scan is unavailable here, so enter the key by hand. Then type the code " +
-    "it shows to confirm — the factor is NOT active until you do, so a " +
-    "mistyped key cannot lock you out."));
+    "Scan the code with your authenticator app, or enter the key below by " +
+    "hand. Then type the code it shows to confirm — the factor is NOT " +
+    "active until you do, so a mistyped key cannot lock you out."));
+  const qr = qrNode(start.qr_rows);
+  if (qr) wrap.appendChild(qr);
   wrap.appendChild(el("div", "mono", start.secret));
   wrap.appendChild(el("div", "small muted",
     "Account " + start.account + " · " + start.digits + " digits · every " +

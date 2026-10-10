@@ -150,6 +150,23 @@ for (const m of HTML.matchAll(/<(\w+)[^>]*\bid="([^"]+)"/g)) {
 const document = {
   getElementById: (id) => byId.get(id) || null,
   createElement: (tag) => new Node(tag),
+  // The QR renderer builds SVG, which is a different namespace. Without this
+  // the enrolment view throws and the whole security card is untestable --
+  // and a shim that silently aliased it to createElement would hide a real
+  // bug, since an <svg> built in the HTML namespace does not render.
+  createElementNS: (ns, tag) => {
+    if (ns !== "http://www.w3.org/2000/svg") {
+      throw new Error("unexpected namespace " + ns);
+    }
+    const n = new Node(tag);
+    n.namespaceURI = ns;
+    // SVG elements keep their LOWERCASE tagName in a real DOM, unlike HTML
+    // elements which report uppercase. Uppercasing them here would make the
+    // shim disagree with the browser about `tagName === "svg"`, which is
+    // exactly the check that distinguishes a real SVG node from an HTML one.
+    n.tagName = tag;
+    return n;
+  },
   createTextNode: (t) => { const n = new Node("#text"); n._text = t; return n; },
 };
 
@@ -475,6 +492,139 @@ check("the secret is shown for manual entry",
       /[A-Z2-7]{32}/.test(secBox.textContent), true);
 check("and warns the factor is not active yet",
       secBox.textContent.includes("NOT active until you do"), true);
+
+/* ---------------------------------------------- the QR is actually drawn */
+// "A QR appeared" is not the claim worth testing -- the claim is that the
+// thing on screen encodes THIS secret. So the SVG the page built is read back
+// out of the DOM, decoded as a QR symbol, and compared against the secret the
+// server issued. A blank plate, a stale symbol, or a wrong quiet zone all fail
+// here; an "element exists" assertion would pass on all three.
+const svg = secBox.find((n) => n.tagName === "svg")[0];
+check("the enrolment view renders an SVG QR", !!svg, true);
+check("built in the SVG namespace, not HTML",
+      svg?.namespaceURI, "http://www.w3.org/2000/svg");
+check("with an accessible label",
+      (svg?.attributes["aria-label"] || "").includes("verification"), true);
+
+const qrPath = svg.children.find((n) => n.tagName === "path");
+const qrRect = svg.children.find((n) => n.tagName === "rect");
+check("has a white backing plate (a dark-themed QR does not scan)",
+      qrRect?.attributes.fill, "#ffffff");
+check("and dark modules drawn as one path",
+      (qrPath?.attributes.d || "").startsWith("M"), true);
+
+// Rebuild the module grid from the path's own geometry, i.e. from what would
+// be painted, then decode it. The grid comes from the viewBox, so a wrong
+// quiet zone shifts everything and the decode fails rather than silently
+// passing.
+const vb = svg.attributes.viewBox.split(" ").map(Number);
+const DIM = vb[2];
+const QUIET = 4;
+const N = DIM - QUIET * 2;
+const grid = Array.from({ length: N }, () => new Array(N).fill(false));
+for (const seg of (qrPath.attributes.d.match(/M\d+ \d+h\d+/g) || [])) {
+  const [, x, y, run] = /M(\d+) (\d+)h(\d+)/.exec(seg).map(Number);
+  for (let i = 0; i < run; i++) {
+    const r = y - QUIET;
+    const c = x - QUIET + i;
+    if (r >= 0 && r < N && c >= 0 && c < N) grid[r][c] = true;
+  }
+}
+check("QR size is a legal symbol dimension", (N - 17) % 4, 0);
+check("finder pattern present in the top-left corner",
+      grid[0].slice(0, 7).every(Boolean) && grid[3][3], true);
+check("timing pattern alternates", grid[6][8], true);
+
+// --- decode it the way a scanner does -------------------------------------
+const decodeQR = (m) => {
+  const n = m.length;
+  const version = (n - 17) / 4;
+  let fmt = 0;
+  for (let i = 0; i < 15; i++) {
+    const bit = i < 6 ? m[i][8] : i < 8 ? m[i + 1][8] : m[n - 15 + i][8];
+    fmt |= (bit ? 1 : 0) << i;
+  }
+  fmt ^= 0b101010000010010;
+  const mask = (fmt >> 10) & 0b111;
+  const maskBit = (r, c) => [
+    (r + c) % 2 === 0, r % 2 === 0, c % 3 === 0, (r + c) % 3 === 0,
+    (Math.floor(r / 2) + Math.floor(c / 3)) % 2 === 0,
+    ((r * c) % 2) + ((r * c) % 3) === 0,
+    (((r * c) % 2) + ((r * c) % 3)) % 2 === 0,
+    (((r + c) % 2) + ((r * c) % 3)) % 2 === 0,
+  ][mask];
+
+  const ALIGN = { 1: [], 2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30],
+                  6: [6, 34], 7: [6, 22, 38], 8: [6, 24, 42], 9: [6, 26, 46],
+                  10: [6, 28, 50] }[version] || [];
+  const res = Array.from({ length: n }, () => new Array(n).fill(false));
+  const block = (r0, c0, h, w) => {
+    for (let r = r0; r < r0 + h; r++)
+      for (let c = c0; c < c0 + w; c++)
+        if (r >= 0 && r < n && c >= 0 && c < n) res[r][c] = true;
+  };
+  block(0, 0, 9, 9); block(0, n - 8, 9, 8); block(n - 8, 0, 8, 9);
+  for (let i = 0; i < n; i++) { res[6][i] = true; res[i][6] = true; }
+  for (const r of ALIGN) for (const c of ALIGN) {
+    if ((r === 6 && c === 6) || (r === 6 && c === n - 7) ||
+        (r === n - 7 && c === 6)) continue;
+    block(r - 2, c - 2, 5, 5);
+  }
+  if (version >= 7) { block(0, n - 11, 6, 3); block(n - 11, 0, 3, 6); }
+
+  const bits = [];
+  let col = n - 1, up = true;
+  while (col > 0) {
+    if (col === 6) col -= 1;
+    const rows = up ? [...Array(n).keys()].reverse() : [...Array(n).keys()];
+    for (const row of rows) for (const c of [col, col - 1]) {
+      if (res[row][c]) continue;
+      bits.push((maskBit(row, c) ? !m[row][c] : m[row][c]) ? 1 : 0);
+    }
+    up = !up; col -= 2;
+  }
+  const words = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8)
+    words.push(parseInt(bits.slice(i, i + 8).join(""), 2));
+
+  // De-interleave (level M block layout for the versions we can emit here).
+  const SPEC = { 1: [[1, 16]], 2: [[1, 28]], 3: [[1, 44]], 4: [[2, 32]],
+                 5: [[2, 43]], 6: [[4, 27]], 7: [[4, 31]],
+                 8: [[2, 38], [2, 39]], 9: [[3, 36], [2, 37]],
+                 10: [[4, 43], [1, 44]] }[version];
+  const sizes = [];
+  for (const [count, size] of SPEC) for (let i = 0; i < count; i++) sizes.push(size);
+  const blocks = sizes.map(() => []);
+  let idx = 0;
+  for (let i = 0; i < Math.max(...sizes); i++)
+    for (let b = 0; b < sizes.length; b++)
+      if (i < sizes[b]) blocks[b].push(words[idx++]);
+  const data = blocks.flat();
+
+  const dbits = data.flatMap((w) => [7, 6, 5, 4, 3, 2, 1, 0].map((s) => (w >> s) & 1));
+  let pos = 0;
+  const take = (k) => { let v = 0; for (let i = 0; i < k; i++) v = (v << 1) | dbits[pos++]; return v; };
+  const mode = take(4);
+  if (mode !== 0b0100) throw new Error("not byte mode: " + mode);
+  const len = take(version < 10 ? 8 : 16);
+  return Buffer.from(Array.from({ length: len }, () => take(8))).toString();
+};
+
+let decoded = "";
+try {
+  decoded = decodeQR(grid);
+} catch (e) {
+  decoded = "DECODE FAILED: " + e.message;
+}
+check("the drawn QR decodes to an otpauth URI",
+      decoded.startsWith("otpauth://totp/"), true);
+check("and carries the SAME secret shown for manual entry",
+      decoded.includes("secret=" + /[A-Z2-7]{32}/.exec(secBox.textContent)[0]),
+      true);
+check("with the issuer the authenticator app will display",
+      decoded.includes("issuer=aibank"), true);
+check("the page tells the user they can scan it",
+      secBox.textContent.includes("Scan the code"), true);
 
 // Compute a real code the way an authenticator would, so the confirm step is
 // exercised for real rather than stubbed.

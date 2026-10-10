@@ -225,6 +225,44 @@ class TestEnrolment(Base):
         with self.assertRaises(U.AuthError):
             U.begin_totp_enrolment(self.bank, self.uid, PASSWORD)
 
+    def test_the_qr_encodes_THIS_user_s_secret(self):
+        """Decode the symbol the route actually returns, like a phone camera.
+
+        `tests/test_qr.py` proves the encoder round-trips, and the page is
+        proven to draw what it is handed. Neither proves the WIRING: that the
+        symbol on the enrolment card carries this user's freshly minted secret
+        rather than a stale one, the URI's unescaped form, or some other
+        account's. A user who scans a QR bound to the wrong secret gets codes
+        the server rejects while the key printed beside it would have worked —
+        indistinguishable, from their side, from 2FA being broken.
+        """
+        from tests.test_qr import _Decoder
+
+        start = U.begin_totp_enrolment(self.bank, self.uid, PASSWORD)
+        rows = start["qr_rows"]
+        self.assertTrue(rows, "enrolment must return a scannable symbol")
+        matrix = [[ch == "1" for ch in row] for row in rows]
+        scanned = _Decoder(matrix).payload().decode()
+
+        self.assertEqual(scanned, start["otpauth_uri"])
+        self.assertIn(f"secret={start['secret']}", scanned)
+        # And the scanned secret must actually drive the factor, not merely
+        # match a string in the response.
+        U.confirm_totp_enrolment(
+            self.bank, self.uid,
+            T.totp(scanned.split("secret=")[1].split("&")[0]))
+        self.assertTrue(U.is_mfa_enrolled(self.bank, self.uid))
+
+    def test_re_enrolment_returns_a_fresh_symbol(self):
+        """A cached QR would hand out a secret the server no longer accepts."""
+        a = U.begin_totp_enrolment(self.bank, self.uid, PASSWORD)
+        U.confirm_totp_enrolment(self.bank, self.uid, T.totp(a["secret"]))
+        U.disable_totp(self.bank, self.uid, PASSWORD,
+                       self.fresh_code(a["secret"]))
+        b = U.begin_totp_enrolment(self.bank, self.uid, PASSWORD)
+        self.assertNotEqual(a["secret"], b["secret"])
+        self.assertNotEqual(a["qr_rows"], b["qr_rows"])
+
     def test_provisioning_uri_is_well_formed(self):
         start = U.begin_totp_enrolment(self.bank, self.uid, PASSWORD)
         uri = start["otpauth_uri"]

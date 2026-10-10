@@ -188,6 +188,14 @@ second factor.
   yields nothing and write access alone cannot substitute an attacker's secret.
   Stated plainly: a dump *plus* the environment does yield them — the same
   trust boundary the API key pepper already defines.
+- **Enrolment shows a scannable QR**, generated server-side by `aibank/qr.py`
+  (ISO/IEC 18004, byte mode, EC level M, stdlib only). The alternative was a
+  JavaScript QR library, which would have been the first third-party script on
+  the page that sets an account's spending limits — the dashboard's
+  `script-src 'self'` is a security property, not a packaging preference. The
+  server returns module rows, never markup, and the page draws the SVG with DOM
+  calls. The key is still shown for hand entry; mistyping 32 base32 characters
+  is how people conclude 2FA is broken and switch it off.
 - **Codes are single-use.** The accepted counter is stored, so an observed code
   cannot be replayed within its 30–90 second validity, and that survives a
   restart.

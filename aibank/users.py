@@ -39,6 +39,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from . import ledger as L
+from . import qr as QR
 from . import totp as T
 
 # scrypt cost. n=2**14, r=8, p=1 costs ~16 MB and tens of ms -- deliberately
@@ -454,9 +455,20 @@ def begin_totp_enrolment(db, user_id: str, current_password: str) -> dict:
             "UPDATE users SET totp_secret_sealed=?, totp_enrolled_at=NULL,"
             " totp_last_counter=NULL WHERE id=?", (sealed, user_id))
         L.audit(conn, None, "user.mfa_enrol_begin", "ok", None, user_id=user_id)
+    uri = T.provisioning_uri(secret, row["email"])
     return {"secret": secret, "issuer": "aibank",
             "account": row["email"],
-            "otpauth_uri": T.provisioning_uri(secret, row["email"]),
+            "otpauth_uri": uri,
+            # The scannable form of the same URI, as rows of '0'/'1' module
+            # strings. Returned HERE rather than from a second route because a
+            # route that renders a QR for an arbitrary string is an encoder
+            # oracle, and one that renders THIS secret would have to unseal it
+            # again outside the one place that is allowed to.
+            #
+            # Modules, not SVG: the page draws them itself, so no
+            # server-supplied markup is ever injected into a document whose
+            # whole defence is that it never does that.
+            "qr_rows": QR.rows_to_strings(QR.encode(uri)),
             "digits": T.DIGITS, "period": T.STEP_SECONDS,
             "enrolled": False}
 
